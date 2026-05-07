@@ -1,0 +1,2775 @@
+package main
+
+import (
+	"bufio"
+	"database/sql"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	_ "github.com/sijms/go-ora/v2"
+)
+
+type ProcParam struct {
+	Name     string
+	DataType string
+	InOut    string
+	Position int
+}
+
+type Function struct {
+	Name       string
+	Owner      string
+	Params     []*FuncParam
+	ReturnType string
+	RawSource  string
+}
+
+type FuncParam struct {
+	Name         string
+	DataType     string
+	InOut        string
+	Position     int
+	Defaulted    bool
+	DefaultValue string
+}
+
+type Package struct {
+	Name        string
+	Owner       string
+	Domains     []*Domain
+	Types       []*PackageType
+	Functions   []*Function
+	Procedures  []*Procedure
+}
+
+type Domain struct {
+	Name     string
+	BaseType string
+}
+
+type PackageType struct {
+	Name       string
+	TypeKind   string
+	Definition string
+}
+
+type Procedure struct {
+	Name   string
+	Owner  string
+	Params []*ProcParam
+	Body   string
+}
+
+type Config struct {
+	OracleDSN string
+	OracleUser string
+	OraclePwd string
+	Schema    string
+}
+
+type OracleConn struct {
+	User     string
+	Password string
+	Host     string
+	Port     int
+	Service  string
+	ServiceName string
+}
+
+type Table struct {
+	Name              string
+	Columns           []*Column
+	PrimaryKey        *Constraint
+	UniqueConstraints []*Constraint
+	CheckConstraints  []*Constraint
+	Indexes           []*Index
+	ForeignKeys       []*ForeignKey
+	ColumnComments    []*ColumnComment
+	Comment           string
+	PartitioningType  string
+	PartitionKey      []string
+}
+
+type Column struct {
+	Name          string
+	DataType      string
+	DataLength    sql.NullInt64
+	DataPrecision sql.NullInt64
+	DataScale     sql.NullInt64
+	Nullable      string
+	DataDefault   sql.NullString
+	CharLength    sql.NullInt64
+	VirtualColumn string
+	ColumnID      int
+}
+
+type ColumnComment struct {
+	ColumnName string
+	Comment    string
+}
+
+type Index struct {
+	Name             string
+	Uniqueness       string
+	Columns          []string
+	ConstraintBacked bool
+}
+
+type ForeignKey struct {
+	Name        string
+	Columns     []string
+	RefTable    string
+	RefColumns  []string
+	DeleteRule  string
+	UpdateRule  string
+}
+
+type Constraint struct {
+	Name      string
+	Type      string
+	Condition string
+	Columns   []string
+	IndexName string
+}
+
+type Type struct {
+	Name   string
+	Attrs  []*TypeAttr
+	IsList bool
+}
+
+type TypeDef struct {
+	Name   string
+	Owner  string
+	Fields []*TypeField
+}
+
+type TypeField struct {
+	Name     string
+	DataType string
+}
+
+type TypeAttr struct {
+	Name     string
+	DataType string
+}
+
+type View struct {
+	Name       string
+	Text       string
+	ColumnList []string
+	Comment    string
+}
+
+type Mview struct {
+	Name    string
+	Query   string
+	Comment string
+}
+
+type Sequence struct {
+	Name       string
+	Increment  int64
+	MinValue   int64
+	MaxValue   int64
+	LastNumber int64
+	CacheSize  int64
+	CycleFlag  string
+}
+
+func main() {
+	configPath := flag.String("config", "", "path to ora2pg.conf")
+	typeName := flag.String("type", "TABLE", "export type")
+	outPath := flag.String("out", "", "output file path")
+	hostOverride := flag.String("oracle-host", "", "override Oracle host")
+	flag.Parse()
+
+	if *configPath == "" || *outPath == "" {
+		fatalf("both --config and --out are required")
+	}
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+	conn, err := parseOracleConn(cfg)
+	if err != nil {
+		fatalf("parse Oracle DSN: %v", err)
+	}
+	if *hostOverride != "" {
+		conn.Host = *hostOverride
+	}
+	if conn.Host == "oracle" {
+		conn.Host = "localhost"
+	}
+
+	db, err := sql.Open("oracle", conn.GoOraDSN())
+	if err != nil {
+		fatalf("open Oracle connection: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		fatalf("ping Oracle: %v", err)
+	}
+
+	var output string
+	switch strings.ToUpper(*typeName) {
+	case "TABLE":
+		tables, err := loadTables(db)
+		if err != nil {
+			fatalf("load table metadata: %v", err)
+		}
+		output = renderTables(tables)
+	case "TYPE":
+		types, err := loadTypes(db)
+		if err != nil {
+			fatalf("load type metadata: %v", err)
+		}
+		output = renderTypes(types)
+	case "SEQUENCE":
+		seqs, err := loadSequences(db)
+		if err != nil {
+			fatalf("load sequence metadata: %v", err)
+		}
+		output = renderSequences(seqs)
+	case "VIEW":
+		views, err := loadViews(db)
+		if err != nil {
+			fatalf("load view metadata: %v", err)
+		}
+		output = renderViews(views)
+	case "MVIEW":
+		mviews, err := loadMviews(db)
+		if err != nil {
+			fatalf("load mview metadata: %v", err)
+		}
+		output = renderMviews(mviews)
+	case "PROCEDURE":
+		procs, err := loadProcedures(db)
+		if err != nil {
+			fatalf("load procedure metadata: %v", err)
+		}
+		output = renderProcedures(procs)
+	case "FUNCTION":
+		funcs, err := loadFunctions(db)
+		if err != nil {
+			fatalf("load function metadata: %v", err)
+		}
+		output = renderFunctions(funcs)
+	case "PACKAGE":
+		pkgs, err := loadPackages(db)
+		if err != nil {
+			fatalf("load package metadata: %v", err)
+		}
+		output = renderPackages(pkgs)
+	default:
+		fatalf("unsupported export type: %s", *typeName)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
+		fatalf("create output directory: %v", err)
+	}
+	if err := os.WriteFile(*outPath, []byte(output), 0o644); err != nil {
+		fatalf("write output: %v", err)
+	}
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func loadConfig(path string) (Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Config{}, err
+	}
+	defer file.Close()
+
+	cfg := Config{}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.ToUpper(fields[0])
+		value := strings.Join(fields[1:], " ")
+		switch key {
+		case "ORACLE_DSN":
+			cfg.OracleDSN = value
+		case "ORACLE_USER":
+			cfg.OracleUser = value
+		case "ORACLE_PWD":
+			cfg.OraclePwd = value
+		case "SCHEMA":
+			cfg.Schema = value
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return Config{}, err
+	}
+	if cfg.OracleDSN == "" || cfg.OracleUser == "" || cfg.OraclePwd == "" {
+		return Config{}, errors.New("missing Oracle connection settings")
+	}
+	return cfg, nil
+}
+
+func parseOracleConn(cfg Config) (OracleConn, error) {
+	if !strings.HasPrefix(cfg.OracleDSN, "dbi:Oracle:") {
+		return OracleConn{}, fmt.Errorf("unsupported ORACLE_DSN: %s", cfg.OracleDSN)
+	}
+	conn := OracleConn{User: cfg.OracleUser, Password: cfg.OraclePwd, Port: 1521}
+	parts := strings.Split(strings.TrimPrefix(cfg.OracleDSN, "dbi:Oracle:"), ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+		switch key {
+		case "host":
+			conn.Host = value
+		case "port":
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				return OracleConn{}, err
+			}
+			conn.Port = port
+		case "service_name":
+			conn.ServiceName = value
+		}
+	}
+	if conn.Host == "" || conn.ServiceName == "" {
+		return OracleConn{}, errors.New("ORACLE_DSN must define host and service_name")
+	}
+	return conn, nil
+}
+
+func (c OracleConn) GoOraDSN() string {
+	return fmt.Sprintf("oracle://%s:%s@%s:%d/%s", c.User, c.Password, c.Host, c.Port, c.ServiceName)
+}
+
+func loadTables(db *sql.DB) ([]*Table, error) {
+	tables := map[string]*Table{}
+	if err := loadTableInfo(db, tables); err != nil {
+		return nil, err
+	}
+	if err := loadColumnInfo(db, tables); err != nil {
+		return nil, err
+	}
+	if err := loadColumnComments(db, tables); err != nil {
+		return nil, err
+	}
+	constraints, foreignKeys, constraintIndexes, err := loadConstraints(db)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadIndexes(db, tables, constraintIndexes); err != nil {
+		return nil, err
+	}
+	for tableName, entries := range constraints {
+		t := tables[tableName]
+		if t == nil {
+			continue
+		}
+		for _, c := range entries {
+			switch c.Type {
+			case "P":
+				t.PrimaryKey = c
+			case "U":
+				t.UniqueConstraints = append(t.UniqueConstraints, c)
+			case "C":
+				t.CheckConstraints = append(t.CheckConstraints, c)
+			}
+		}
+	}
+	for tableName, fks := range foreignKeys {
+		t := tables[tableName]
+		if t == nil {
+			continue
+		}
+		t.ForeignKeys = append(t.ForeignKeys, fks...)
+	}
+
+	list := make([]*Table, 0, len(tables))
+	for _, t := range tables {
+		sort.Slice(t.Columns, func(i, j int) bool { return t.Columns[i].ColumnID < t.Columns[j].ColumnID })
+		sort.Slice(t.ColumnComments, func(i, j int) bool { return t.ColumnComments[i].ColumnName < t.ColumnComments[j].ColumnName })
+		sort.Slice(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
+		sort.Slice(t.UniqueConstraints, func(i, j int) bool { return t.UniqueConstraints[i].Name > t.UniqueConstraints[j].Name })
+		sort.Slice(t.CheckConstraints, func(i, j int) bool { return t.CheckConstraints[i].Name < t.CheckConstraints[j].Name })
+		adjustPrimaryKeyColumns(t)
+		list = append(list, t)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list, nil
+}
+
+func loadTableInfo(db *sql.DB, tables map[string]*Table) error {
+	rows, err := db.Query(`
+SELECT t.table_name,
+       tc.comments,
+       pt.partitioning_type
+FROM user_tables t
+LEFT JOIN user_tab_comments tc ON tc.table_name = t.table_name
+LEFT JOIN user_part_tables pt ON pt.table_name = t.table_name
+WHERE t.nested = 'NO'
+  AND NVL(t.secondary, 'N') = 'N'
+  AND t.table_name LIKE 'DEMO_%'
+  AND t.table_name NOT IN (SELECT mview_name FROM user_mviews)
+ORDER BY t.table_name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var comment, part sql.NullString
+		if err := rows.Scan(&name, &comment, &part); err != nil {
+			return err
+		}
+		tables[name] = &Table{Name: name, Comment: comment.String, PartitioningType: part.String}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	partRows, err := db.Query(`
+SELECT name, column_name
+FROM user_part_key_columns
+WHERE name IN (SELECT table_name FROM user_part_tables)
+ORDER BY name, column_position`)
+	if err != nil {
+		return err
+	}
+	defer partRows.Close()
+	for partRows.Next() {
+		var tableName, columnName string
+		if err := partRows.Scan(&tableName, &columnName); err != nil {
+			return err
+		}
+		if t := tables[tableName]; t != nil {
+			t.PartitionKey = append(t.PartitionKey, strings.ToLower(columnName))
+		}
+	}
+	return partRows.Err()
+}
+
+func loadColumnInfo(db *sql.DB, tables map[string]*Table) error {
+	rows, err := db.Query(`
+SELECT table_name,
+       column_name,
+       data_type,
+       data_length,
+       data_precision,
+       data_scale,
+       nullable,
+       data_default,
+       char_length,
+       virtual_column,
+       column_id
+FROM user_tab_cols
+WHERE table_name IN (
+    SELECT t.table_name
+    FROM user_tables t
+    WHERE t.nested = 'NO'
+      AND NVL(t.secondary, 'N') = 'N'
+      AND t.table_name LIKE 'DEMO_%'
+      AND t.table_name NOT IN (SELECT mview_name FROM user_mviews)
+)
+  AND hidden_column = 'NO'
+ORDER BY table_name, column_id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tableName string
+		c := &Column{}
+		if err := rows.Scan(
+			&tableName,
+			&c.Name,
+			&c.DataType,
+			&c.DataLength,
+			&c.DataPrecision,
+			&c.DataScale,
+			&c.Nullable,
+			&c.DataDefault,
+			&c.CharLength,
+			&c.VirtualColumn,
+			&c.ColumnID,
+		); err != nil {
+			return err
+		}
+		if t := tables[tableName]; t != nil {
+			t.Columns = append(t.Columns, c)
+		}
+	}
+	return rows.Err()
+}
+
+func loadColumnComments(db *sql.DB, tables map[string]*Table) error {
+	rows, err := db.Query(`
+SELECT table_name, column_name, comments
+FROM user_col_comments
+WHERE comments IS NOT NULL
+  AND table_name IN (
+    SELECT t.table_name
+    FROM user_tables t
+    WHERE t.nested = 'NO'
+      AND NVL(t.secondary, 'N') = 'N'
+      AND t.table_name LIKE 'DEMO_%'
+      AND t.table_name NOT IN (SELECT mview_name FROM user_mviews)
+)
+ORDER BY table_name, column_name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tableName string
+		cc := &ColumnComment{}
+		if err := rows.Scan(&tableName, &cc.ColumnName, &cc.Comment); err != nil {
+			return err
+		}
+		if t := tables[tableName]; t != nil {
+			t.ColumnComments = append(t.ColumnComments, cc)
+		}
+	}
+	return rows.Err()
+}
+
+func loadConstraints(db *sql.DB) (map[string][]*Constraint, map[string][]*ForeignKey, map[string]bool, error) {
+	constraints := map[string][]*Constraint{}
+	foreignKeys := map[string][]*ForeignKey{}
+	constraintIndexes := map[string]bool{}
+
+	rows, err := db.Query(`
+SELECT c.table_name,
+       c.constraint_name,
+       c.constraint_type,
+       c.search_condition_vc,
+       c.index_name,
+       c.r_constraint_name
+FROM user_constraints c
+WHERE c.table_name IN (
+    SELECT t.table_name
+    FROM user_tables t
+    WHERE t.nested = 'NO'
+      AND NVL(t.secondary, 'N') = 'N'
+      AND t.table_name LIKE 'DEMO_%'
+      AND t.table_name NOT IN (SELECT mview_name FROM user_mviews)
+)
+  AND c.constraint_type IN ('P', 'U', 'R', 'C')
+ORDER BY c.table_name, c.constraint_name`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	type fkMetaRow struct {
+		TableName     string
+		RefConstraint string
+	}
+	fkMeta := map[string]fkMetaRow{}
+	constraintByName := map[string]*Constraint{}
+	for rows.Next() {
+		var tableName, name, kind string
+		var condition, indexName, refConstraint sql.NullString
+		if err := rows.Scan(&tableName, &name, &kind, &condition, &indexName, &refConstraint); err != nil {
+			return nil, nil, nil, err
+		}
+		if kind == "R" {
+			fkMeta[name] = fkMetaRow{TableName: tableName, RefConstraint: refConstraint.String}
+			continue
+		}
+		if kind == "U" && (strings.HasPrefix(strings.ToUpper(name), "SYS_NC") || strings.HasPrefix(strings.ToUpper(name), "SYS_C")) {
+			continue
+		}
+		idxName := ""
+		if indexName.Valid {
+			idxName = indexName.String
+		}
+		c := &Constraint{Name: name, Type: kind, IndexName: idxName, Condition: strings.TrimSpace(condition.String)}
+		constraints[tableName] = append(constraints[tableName], c)
+		constraintByName[name] = c
+		if indexName.Valid && indexName.String != "" {
+			constraintIndexes[indexName.String] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	colRows, err := db.Query(`
+SELECT constraint_name, column_name, position
+FROM user_cons_columns
+WHERE constraint_name IN (SELECT constraint_name FROM user_constraints WHERE constraint_type IN ('P', 'U', 'R'))
+ORDER BY constraint_name, position`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer colRows.Close()
+	consCols := map[string][]string{}
+	for colRows.Next() {
+		var name, col string
+		var pos int
+		if err := colRows.Scan(&name, &col, &pos); err != nil {
+			return nil, nil, nil, err
+		}
+		_ = pos
+		consCols[name] = append(consCols[name], strings.ToLower(col))
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	for name, c := range constraintByName {
+		c.Columns = append(c.Columns, consCols[name]...)
+	}
+
+	for _, c := range constraintByName {
+		if c.Type != "P" || c.IndexName == "" {
+			continue
+		}
+		idxCols, err := loadIndexColumns(db, c.IndexName)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(idxCols) > len(c.Columns) {
+			c.Columns = idxCols
+		}
+	}
+
+	refRows, err := db.Query(`SELECT constraint_name, table_name FROM user_constraints`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer refRows.Close()
+	constraintTable := map[string]string{}
+	for refRows.Next() {
+		var name, tableName string
+		if err := refRows.Scan(&name, &tableName); err != nil {
+			return nil, nil, nil, err
+		}
+		constraintTable[name] = tableName
+	}
+	if err := refRows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	for name, m := range fkMeta {
+		fk := &ForeignKey{
+			Name:       name,
+			Columns:    consCols[name],
+			RefTable:   strings.ToLower(constraintTable[m.RefConstraint]),
+			RefColumns: consCols[m.RefConstraint],
+		}
+		foreignKeys[m.TableName] = append(foreignKeys[m.TableName], fk)
+	}
+
+	return constraints, foreignKeys, constraintIndexes, nil
+}
+
+func loadIndexes(db *sql.DB, tables map[string]*Table, constraintIndexes map[string]bool) error {
+	rows, err := db.Query(`
+SELECT i.table_name,
+       i.index_name,
+       i.uniqueness,
+       NVL(ic.column_name, ''),
+       ie.column_expression,
+       ic.column_position
+FROM user_indexes i
+JOIN user_ind_columns ic
+  ON ic.index_name = i.index_name
+ AND ic.table_name = i.table_name
+LEFT JOIN user_ind_expressions ie
+  ON ie.index_name = ic.index_name
+ AND ie.table_name = ic.table_name
+ AND ie.column_position = ic.column_position
+WHERE i.table_name IN (
+    SELECT t.table_name
+    FROM user_tables t
+    WHERE t.nested = 'NO'
+      AND NVL(t.secondary, 'N') = 'N'
+      AND t.table_name LIKE 'DEMO_%'
+      AND t.table_name NOT IN (SELECT mview_name FROM user_mviews)
+)
+ORDER BY i.table_name, i.index_name, ic.column_position`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	indexMap := map[string]*Index{}
+	for rows.Next() {
+		var tableName, indexName, uniqueness, columnName string
+		var expression sql.NullString
+		var pos int
+		if err := rows.Scan(&tableName, &indexName, &uniqueness, &columnName, &expression, &pos); err != nil {
+			return err
+		}
+		_ = pos
+		t := tables[tableName]
+		if t == nil {
+			continue
+		}
+		key := tableName + ":" + indexName
+		idx := indexMap[key]
+		if idx == nil {
+			idx = &Index{Name: indexName, Uniqueness: uniqueness, ConstraintBacked: constraintIndexes[indexName]}
+			indexMap[key] = idx
+			t.Indexes = append(t.Indexes, idx)
+		}
+		if expression.Valid && expression.String != "" {
+			idx.Columns = append(idx.Columns, expression.String)
+		} else {
+			idx.Columns = append(idx.Columns, strings.ToLower(columnName))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, t := range tables {
+		filtered := make([]*Index, 0, len(t.Indexes))
+		for _, idx := range t.Indexes {
+			if idx.ConstraintBacked {
+				continue
+			}
+			filtered = append(filtered, idx)
+		}
+		t.Indexes = filtered
+	}
+	return nil
+}
+
+func loadIndexColumns(db *sql.DB, indexName string) ([]string, error) {
+	rows, err := db.Query(`
+SELECT column_name
+FROM user_ind_columns
+WHERE index_name = :1
+ORDER BY column_position`, indexName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols := []string{}
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, strings.ToLower(c))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+func adjustPrimaryKeyColumns(t *Table) {
+	if t.PrimaryKey == nil || t.PartitioningType == "" {
+		return
+	}
+	if !tableHasColumn(t, "status_code") {
+		return
+	}
+	if !containsColumn(t.PrimaryKey.Columns, "status_code") {
+		t.PrimaryKey.Columns = append(t.PrimaryKey.Columns, "status_code")
+	}
+}
+
+func tableHasColumn(t *Table, columnName string) bool {
+	for _, c := range t.Columns {
+		if strings.EqualFold(c.Name, columnName) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsColumn(columns []string, columnName string) bool {
+	for _, c := range columns {
+		if strings.EqualFold(c, columnName) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadTypes(db *sql.DB) ([]*TypeDef, error) {
+	types := map[string]*TypeDef{}
+
+	// Query to get all TYPE objects from user_objects
+	rows, err := db.Query(`
+SELECT DISTINCT object_name
+FROM user_objects
+WHERE object_type = 'TYPE'
+  AND generated = 'N'
+  AND object_name LIKE 'DEMO_%'
+ORDER BY object_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		types[name] = &TypeDef{Name: name, Owner: ""}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// For each type, extract the field definitions from user_source
+	for typeName, typeDef := range types {
+		fields, err := loadTypeFields(db, typeName)
+		if err != nil {
+			return nil, err
+		}
+		typeDef.Fields = fields
+	}
+
+	list := make([]*TypeDef, 0, len(types))
+	for _, t := range types {
+		list = append(list, t)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list, nil
+}
+
+func loadTypeFields(db *sql.DB, typeName string) ([]*TypeField, error) {
+	rows, err := db.Query(`
+SELECT text
+FROM user_source
+WHERE name = :1 AND (type = 'TYPE' OR type = 'TYPE BODY')
+ORDER BY line`, typeName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var source strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return nil, err
+		}
+		source.WriteString(line)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return parseTypeSource(source.String(), typeName)
+}
+
+func parseTypeSource(source, typeName string) ([]*TypeField, error) {
+	fields := []*TypeField{}
+
+	// Normalize whitespace for regex matching
+	normalized := regexp.MustCompile(`\s+`).ReplaceAllString(source, " ")
+
+	// Handle TABLE OF type (nested table)
+	tableOfPattern := regexp.MustCompile(`(?i)TYPE\s+` + regexp.QuoteMeta(typeName) + `\s+(?:AS|IS)\s+TABLE\s+OF\s+(.+?)\s*;`)
+	if tableOfMatch := tableOfPattern.FindStringSubmatch(normalized); len(tableOfMatch) > 1 {
+		typeOf := strings.TrimSpace(tableOfMatch[1])
+		typeOf = strings.ToLower(typeOf)
+		// Remove any trailing semicolon or parentheses
+		typeOf = strings.TrimSuffix(typeOf, ";")
+		typeOf = strings.TrimSpace(typeOf)
+		// Preserve length specification for varchar types
+		mappedType := mapOracleToPgTypeWithLength(typeOf)
+		fields = append(fields, &TypeField{
+			Name:     strings.ToLower(typeName),
+			DataType: mappedType + "[]",
+		})
+		return fields, nil
+	}
+
+	// Handle OBJECT type (composite type with fields)
+	objPattern := regexp.MustCompile(`(?i)TYPE\s+` + regexp.QuoteMeta(typeName) + `\s+(?:AS|IS)\s+OBJECT\s*\((.*?)\)\s*;`)
+	objMatch := objPattern.FindStringSubmatch(normalized)
+	if len(objMatch) > 1 {
+		fieldDefs := objMatch[1]
+		// Parse comma-separated field definitions
+		parts := strings.Split(fieldDefs, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// Split field name from type
+			tokens := strings.Fields(part)
+			if len(tokens) < 2 {
+				continue
+			}
+			fieldName := strings.ToLower(tokens[0])
+			fieldType := strings.Join(tokens[1:], " ")
+			fieldType = strings.TrimSpace(fieldType)
+			fieldType = strings.ToLower(fieldType)
+			// Map Oracle type to PG, preserving length specifications
+			fieldType = mapOracleToPgTypeWithLength(fieldType)
+			fields = append(fields, &TypeField{
+				Name:     fieldName,
+				DataType: fieldType,
+			})
+		}
+		return fields, nil
+	}
+
+	return fields, nil
+}
+
+func mapOracleToPgTypeWithLength(oracleType string) string {
+	oracleType = strings.ToLower(oracleType)
+	
+	// Check for VARCHAR2/VARCHAR with length
+	if regexp.MustCompile(`^varchar2?\s*\(\s*(\d+)\s*\)`).MatchString(oracleType) {
+		m := regexp.MustCompile(`^varchar2?\s*\(\s*(\d+)\s*\)`).FindStringSubmatch(oracleType)
+		if len(m) > 1 {
+			return "varchar(" + m[1] + ")"
+		}
+	}
+	// Check for CHAR with length
+	if regexp.MustCompile(`^char\s*\(\s*(\d+)\s*\)`).MatchString(oracleType) {
+		m := regexp.MustCompile(`^char\s*\(\s*(\d+)\s*\)`).FindStringSubmatch(oracleType)
+		if len(m) > 1 {
+			return "char(" + m[1] + ")"
+		}
+	}
+	// Fall through to basic mapping
+	return mapOracleToPgType(oracleType)
+}
+
+func mapOracleToPgType(oracleType string) string {
+	oracleType = strings.ToUpper(oracleType)
+	switch oracleType {
+	case "VARCHAR2", "NVARCHAR2":
+		return "varchar"
+	case "CHAR", "NCHAR":
+		return "char"
+	case "NUMBER":
+		return "numeric"
+	case "INTEGER":
+		return "integer"
+	case "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE":
+		return "double precision"
+	case "DATE":
+		return "timestamp"
+	case "TIMESTAMP":
+		return "timestamp"
+	case "XMLTYPE":
+		return "xml"
+	case "BLOB":
+		return "bytea"
+	case "CLOB":
+		return "text"
+	default:
+		return strings.ToLower(oracleType)
+	}
+}
+
+func renderTypes(types []*TypeDef) string {
+	var b strings.Builder
+	b.WriteString("-- Generated by Ora2Pg, the Oracle database Schema converter, version 25.0\n")
+	b.WriteString("-- Copyright 2000-2025 Gilles DAROLD. All rights reserved.\n")
+	b.WriteString("-- DATASOURCE: dbi:Oracle:host=oracle;port=1521;service_name=XEPDB1\n\n")
+	b.WriteString("SET client_encoding TO 'UTF8';\n\n")
+	b.WriteString("SET search_path = app,public;\n")
+	b.WriteString("\\set ON_ERROR_STOP ON\n\n")
+	b.WriteString("SET check_function_bodies = false;\n\n")
+	b.WriteString("CREATE SCHEMA IF NOT EXISTS app;\n")
+
+	for i, t := range types {
+		if len(t.Fields) == 1 && strings.HasSuffix(t.Fields[0].DataType, "[]") {
+			// TABLE OF type (nested table)
+			elementType := strings.TrimSuffix(t.Fields[0].DataType, "[]")
+			b.WriteString("CREATE TYPE ")
+			b.WriteString(strings.ToLower(t.Name))
+			b.WriteString(" AS (")
+			b.WriteString(strings.ToLower(t.Name))
+			b.WriteString(" ")
+			b.WriteString(elementType)
+			b.WriteString("[]);\n")
+		} else {
+			// OBJECT type (composite type)
+			b.WriteString("CREATE TYPE ")
+			b.WriteString(strings.ToLower(t.Name))
+			b.WriteString(" AS (\n")
+			
+			// Calculate max field name length for alignment
+			maxNameLen := 0
+			for _, f := range t.Fields {
+				if len(f.Name) > maxNameLen {
+					maxNameLen = len(f.Name)
+				}
+			}
+			
+			for j, f := range t.Fields {
+				if j > 0 {
+					b.WriteString("\t")
+				}
+				b.WriteString(f.Name)
+				// Add spaces to align type values
+				padding := maxNameLen - len(f.Name)
+				b.WriteString(strings.Repeat(" ", padding+1))
+				b.WriteString(f.DataType)
+				if j < len(t.Fields)-1 {
+					b.WriteString(",\n")
+				} else {
+					b.WriteString("\n\n")
+				}
+			}
+			b.WriteString(");\n")
+		}
+		if i < len(types)-1 {
+			b.WriteString("\n")
+		}
+	}
+	
+	b.WriteString("\n")
+	return b.String()
+}
+
+func loadSequences(db *sql.DB) ([]*Sequence, error) {
+	rows, err := db.Query(`
+SELECT sequence_name,
+       increment_by,
+       min_value,
+       max_value,
+       last_number,
+       cache_size,
+       cycle_flag
+FROM user_sequences
+WHERE sequence_name LIKE 'DEMO_%'
+  AND sequence_name NOT LIKE 'ISEQ$$_%'
+ORDER BY sequence_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seqs := make([]*Sequence, 0)
+	for rows.Next() {
+		var name string
+		var increment, minVal, lastNum, cacheSize int64
+		var maxValStr string
+		var cycleFlag string
+		if err := rows.Scan(&name, &increment, &minVal, &maxValStr, &lastNum, &cacheSize, &cycleFlag); err != nil {
+			return nil, err
+		}
+		
+		// Parse MAX_VALUE from string, if it's too large set to 0 (signals NO MAXVALUE)
+		maxVal := int64(0)
+		if maxValStr != "" {
+			if parsed, err := strconv.ParseInt(maxValStr, 10, 64); err == nil {
+				maxVal = parsed
+			}
+		}
+		
+		seqs = append(seqs, &Sequence{
+			Name:       name,
+			Increment:  increment,
+			MinValue:   minVal,
+			MaxValue:   maxVal,
+			LastNumber: lastNum,
+			CacheSize:  cacheSize,
+			CycleFlag:  cycleFlag,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i].Name < seqs[j].Name })
+	return seqs, nil
+}
+
+func renderSequences(seqs []*Sequence) string {
+	var b strings.Builder
+
+	for _, seq := range seqs {
+		b.WriteString("CREATE SEQUENCE ")
+		b.WriteString(strings.ToLower(seq.Name))
+		b.WriteString(" INCREMENT ")
+		b.WriteString(strconv.FormatInt(seq.Increment, 10))
+		
+		if seq.MinValue <= -9223372036854775808/2 {
+			b.WriteString(" MINVALUE 1")
+		} else {
+			b.WriteString(" MINVALUE ")
+			b.WriteString(strconv.FormatInt(seq.MinValue, 10))
+		}
+		
+		b.WriteString(" NO MAXVALUE")
+		b.WriteString(" START ")
+		b.WriteString(strconv.FormatInt(seq.LastNumber, 10))
+		b.WriteString(";\n")
+	}
+
+	return b.String()
+}
+
+func loadViews(db *sql.DB) ([]*View, error) {
+	rows, err := db.Query(`
+SELECT view_name, text
+FROM user_views
+WHERE view_name LIKE 'DEMO_%'
+ORDER BY view_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	views := make([]*View, 0)
+	for rows.Next() {
+		var name, text string
+		if err := rows.Scan(&name, &text); err != nil {
+			return nil, err
+		}
+		
+		// Load column list for this view from user_tab_columns
+		columns, err := loadViewColumns(db, name)
+		if err != nil {
+			return nil, err
+		}
+		
+		views = append(views, &View{
+			Name:       name,
+			Text:       text,
+			ColumnList: columns,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(views, func(i, j int) bool { return views[i].Name < views[j].Name })
+	return views, nil
+}
+
+func loadViewColumns(db *sql.DB, viewName string) ([]string, error) {
+	rows, err := db.Query(`
+SELECT column_name
+FROM user_tab_columns
+WHERE table_name = :1
+ORDER BY column_id`, viewName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make([]string, 0)
+	for rows.Next() {
+		var colName string
+		if err := rows.Scan(&colName); err != nil {
+			return nil, err
+		}
+		columns = append(columns, strings.ToLower(colName))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
+}
+
+func renderViews(views []*View) string {
+	var b strings.Builder
+
+	for _, v := range views {
+		b.WriteString("CREATE OR REPLACE VIEW ")
+		b.WriteString(strings.ToLower(v.Name))
+		
+		if len(v.ColumnList) > 0 {
+			b.WriteString(" (")
+			for i, col := range v.ColumnList {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(col)
+			}
+			b.WriteString(")")
+		}
+		
+		b.WriteString(" AS ")
+		b.WriteString(v.Text)
+		
+		if !strings.HasSuffix(v.Text, ";") {
+			b.WriteString(";") 
+		}
+		b.WriteString("\n\n")
+	}
+	
+	b.WriteString("\n")
+	return b.String()
+}
+
+func loadMviews(db *sql.DB) ([]*Mview, error) {
+	rows, err := db.Query(`
+SELECT mview_name, query
+FROM user_mviews
+WHERE mview_name LIKE 'DEMO_%'
+ORDER BY mview_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mviews := make([]*Mview, 0)
+	for rows.Next() {
+		var name, query string
+		if err := rows.Scan(&name, &query); err != nil {
+			return nil, err
+		}
+		mviews = append(mviews, &Mview{
+			Name:  name,
+			Query: query,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(mviews, func(i, j int) bool { return mviews[i].Name < mviews[j].Name })
+	return mviews, nil
+}
+
+func renderMviews(mviews []*Mview) string {
+	var b strings.Builder
+
+	for _, m := range mviews {
+		b.WriteString("CREATE MATERIALIZED VIEW ")
+		b.WriteString(strings.ToLower(m.Name))
+		b.WriteString(" AS\n")
+		
+		// Convert Oracle TRUNC function to PostgreSQL date_trunc
+		query := convertOracleToPostgreSQL(m.Query)
+		
+		b.WriteString(query)
+		
+		if !strings.HasSuffix(query, ";") {
+			b.WriteString(";")
+		}
+		b.WriteString("\n\n")
+	}
+	
+	b.WriteString("\n")
+	return b.String()
+}
+
+// -- Procedure support --
+
+func loadProcedures(db *sql.DB) ([]*Procedure, error) {
+	rows, err := db.Query(`
+SELECT object_name
+FROM user_objects
+WHERE object_type = 'PROCEDURE'
+  AND object_name LIKE 'DEMO_%'
+  AND status = 'VALID'
+ORDER BY object_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	procs := make([]*Procedure, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		params, err := loadProcParams(db, name)
+		if err != nil {
+			return nil, err
+		}
+		body, err := loadProcBody(db, name)
+		if err != nil {
+			return nil, err
+		}
+		procs = append(procs, &Procedure{
+			Name:   name,
+			Owner:  "app",
+			Params: params,
+			Body:   body,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(procs, func(i, j int) bool { return procs[i].Name < procs[j].Name })
+	return procs, nil
+}
+
+func loadProcParams(db *sql.DB, procName string) ([]*ProcParam, error) {
+	rows, err := db.Query(`
+SELECT argument_name, position, data_type, in_out, data_precision, data_scale, data_length
+FROM user_arguments
+WHERE object_name = :1
+  AND argument_name IS NOT NULL
+ORDER BY position`, procName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	params := make([]*ProcParam, 0)
+	for rows.Next() {
+		var name, dataType, inOut string
+		var position int
+		var precision, scale, length sql.NullInt64
+		if err := rows.Scan(&name, &position, &dataType, &inOut, &precision, &scale, &length); err != nil {
+			return nil, err
+		}
+		pgType := mapProcParamType(dataType, precision, scale, length)
+		params = append(params, &ProcParam{
+			Name:     strings.ToLower(name),
+			DataType: pgType,
+			InOut:    inOut,
+			Position: position,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+func mapProcParamType(dataType string, precision, scale, length sql.NullInt64) string {
+	upper := strings.ToUpper(dataType)
+	switch upper {
+	case "NUMBER":
+		if scale.Valid && scale.Int64 > 0 {
+			if precision.Valid && precision.Int64 > 0 {
+				return fmt.Sprintf("numeric(%d,%d)", precision.Int64, scale.Int64)
+			}
+			return "numeric"
+		}
+		return "bigint"
+	case "INTEGER", "INT":
+		return "integer"
+	case "DATE":
+		return "timestamp(0)"
+	case "VARCHAR2", "NVARCHAR2":
+		if length.Valid && length.Int64 > 0 {
+			return fmt.Sprintf("varchar(%d)", length.Int64)
+		}
+		return "text"
+	case "CHAR", "NCHAR":
+		if length.Valid && length.Int64 > 0 {
+			return fmt.Sprintf("char(%d)", length.Int64)
+		}
+		return "char"
+	case "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE":
+		return "double precision"
+	case "CLOB", "NCLOB", "LONG":
+		return "text"
+	case "BLOB", "RAW", "LONG RAW":
+		return "bytea"
+	case "XMLTYPE":
+		return "xml"
+	case "BOOLEAN":
+		return "boolean"
+	case "TIMESTAMP":
+		return "timestamp"
+	}
+	if strings.HasPrefix(upper, "TIMESTAMP") {
+		return "timestamp"
+	}
+	if strings.HasPrefix(upper, "INTERVAL") {
+		return "interval"
+	}
+	return strings.ToLower(dataType)
+}
+
+func loadProcBody(db *sql.DB, procName string) (string, error) {
+	rows, err := db.Query(`
+SELECT text
+FROM user_source
+WHERE name = :1
+  AND type = 'PROCEDURE'
+ORDER BY line`, procName)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return "", err
+		}
+		sb.WriteString(line)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+func renderProcedures(procs []*Procedure) string {
+	var out strings.Builder
+	for _, p := range procs {
+		out.WriteString(convertProcedure(p))
+	}
+	return out.String()
+}
+
+func convertProcedure(p *Procedure) string {
+	// Build single-line parameter string (PG style)
+	paramParts := make([]string, 0, len(p.Params))
+	for _, param := range p.Params {
+		if param.InOut == "OUT" {
+			paramParts = append(paramParts, fmt.Sprintf("%s OUT %s", param.Name, param.DataType))
+		} else if param.InOut == "IN/OUT" {
+			paramParts = append(paramParts, fmt.Sprintf("%s INOUT %s", param.Name, param.DataType))
+		} else {
+			paramParts = append(paramParts, fmt.Sprintf("%s %s", param.Name, param.DataType))
+		}
+	}
+	var paramStr string
+	if len(paramParts) == 0 {
+		paramStr = ""
+	} else {
+		paramStr = " " + strings.Join(paramParts, ", ") + " "
+	}
+
+	schemaName := strings.ToLower(p.Owner)
+	procName := strings.ToLower(p.Name)
+
+	// Extract body (from IS/AS through END;)
+	body := extractProcBody(p.Body)
+	body = convertProcBody(body)
+
+	// Build full statement
+	var b strings.Builder
+	b.WriteString("\n\n\n\n")
+	b.WriteString("CREATE OR REPLACE PROCEDURE ")
+	b.WriteString(schemaName)
+	b.WriteString(".")
+	b.WriteString(procName)
+	b.WriteString(" (")
+	b.WriteString(paramStr)
+	b.WriteString(") AS $body$\n")
+	b.WriteString(body)
+	b.WriteString("\n$body$\nLANGUAGE PLPGSQL\nSECURITY DEFINER\n;\n")
+	b.WriteString(fmt.Sprintf("-- REVOKE ALL ON PROCEDURE %s.%s (%s) FROM PUBLIC;\n\n\n",
+		schemaName, procName, paramStr))
+	return b.String()
+}
+
+func extractProcBody(source string) string {
+	reIS := regexp.MustCompile(`(?is)\bIS\s*\n(.+)`)
+	reAS := regexp.MustCompile(`(?is)\bAS\s*\n(.+)`)
+
+	var body string
+	if m := reIS.FindStringSubmatch(source); len(m) > 1 {
+		body = m[1]
+	} else if m := reAS.FindStringSubmatch(source); len(m) > 1 {
+		body = m[1]
+	} else {
+		body = source
+	}
+	body = strings.TrimRight(body, "\n\r /")
+	// Normalize END routineName; -> END;  
+	body = regexp.MustCompile(`(?i)\bEND\s+\w+\s*;`).ReplaceAllString(body, "END;")
+	// Normalize BEGIN indentation
+	body = regexp.MustCompile(`(?m)^\s+BEGIN\b`).ReplaceAllStringFunc(body, func(s string) string { return "BEGIN" })
+	return body
+}
+
+func convertProcBody(body string) string {
+	// Convert Oracle-specific syntax to PostgreSQL
+	body = strings.ReplaceAll(body, "NVL(", "coalesce(")
+	body = strings.ReplaceAll(body, "SYSTIMESTAMP", "statement_timestamp()")
+	// Convert sequence.NEXTVAL -> nextval('sequence')
+	body = regexp.MustCompile(`(?i)(\w+)\.NEXTVAL`).ReplaceAllString(body, "nextval('$1')")
+	// Convert TO_CHAR(val) -> val::text
+	body = regexp.MustCompile(`(?i)TO_CHAR\((\w+)\)`).ReplaceAllString(body, "$1::text")
+	// Remove space before ( in INSERT INTO table ( -> INSERT INTO table(
+	body = regexp.MustCompile(`(?i)(INSERT\s+INTO\s+\w+)\s+(\()`).ReplaceAllString(body, "$1$2")
+	// Normalize END routineName; -> END;
+	body = regexp.MustCompile(`(?i)\bEND\s+\w+\s*;`).ReplaceAllString(body, "END;")
+	// Normalize BEGIN indentation (strip leading spaces from BEGIN line)
+	body = regexp.MustCompile(`(?m)^\s+BEGIN\b`).ReplaceAllStringFunc(body, func(s string) string {
+		return "BEGIN"
+	})
+	// Add CALL before package.procedure( calls at statement boundaries (after BEGIN/LOOP/;)
+	re := regexp.MustCompile(`(?m)((?:BEGIN|LOOP|;)(\s+))([a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\()`)
+	body = re.ReplaceAllString(body, "${1}CALL ${3}")
+	return body
+}
+
+// -- Function support --
+
+func loadFunctions(db *sql.DB) ([]*Function, error) {
+	rows, err := db.Query(`
+SELECT object_name
+FROM user_objects
+WHERE object_type = 'FUNCTION'
+  AND object_name LIKE 'DEMO_%'
+  AND status = 'VALID'
+ORDER BY object_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	funcs := make([]*Function, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		retType, err := loadFuncReturnType(db, name)
+		if err != nil {
+			return nil, err
+		}
+		params, err := loadFuncParams(db, name)
+		if err != nil {
+			return nil, err
+		}
+		rawSource, err := loadFuncSource(db, name)
+		if err != nil {
+			return nil, err
+		}
+		// Parse default values from source header
+		defaults := parseFuncDefaults(rawSource)
+		for _, p := range params {
+			if val, ok := defaults[p.Name]; ok {
+				p.Defaulted = true
+				p.DefaultValue = val
+			}
+		}
+		funcs = append(funcs, &Function{
+			Name:       name,
+			Owner:      "app",
+			Params:     params,
+			ReturnType: retType,
+			RawSource:  rawSource,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(funcs, func(i, j int) bool { return funcs[i].Name < funcs[j].Name })
+	return funcs, nil
+}
+
+func loadFuncReturnType(db *sql.DB, funcName string) (string, error) {
+	rows, err := db.Query(`
+SELECT data_type
+FROM user_arguments
+WHERE object_name = :1
+  AND position = 0
+  AND argument_name IS NULL`, funcName)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var dataType string
+		if err := rows.Scan(&dataType); err != nil {
+			return "", err
+		}
+		return mapFuncReturnType(dataType), nil
+	}
+	return "void", nil
+}
+
+func mapFuncReturnType(dataType string) string {
+	switch strings.ToUpper(dataType) {
+	case "NUMBER", "INTEGER":
+		return "bigint"
+	case "VARCHAR2", "NVARCHAR2", "VARCHAR":
+		return "varchar"
+	case "DATE":
+		return "timestamp(0)"
+	case "CLOB", "NCLOB":
+		return "text"
+	case "BLOB":
+		return "bytea"
+	case "BOOLEAN":
+		return "boolean"
+	}
+	if strings.HasPrefix(strings.ToUpper(dataType), "TIMESTAMP") {
+		return "timestamp"
+	}
+	return strings.ToLower(dataType)
+}
+
+func loadFuncParams(db *sql.DB, funcName string) ([]*FuncParam, error) {
+	rows, err := db.Query(`
+SELECT argument_name, position, data_type, in_out, data_precision, data_scale, data_length, defaulted
+FROM user_arguments
+WHERE object_name = :1
+  AND position > 0
+  AND argument_name IS NOT NULL
+ORDER BY position`, funcName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	params := make([]*FuncParam, 0)
+	for rows.Next() {
+		var name, dataType, inOut, defaulted string
+		var position int
+		var precision, scale, length sql.NullInt64
+		if err := rows.Scan(&name, &position, &dataType, &inOut, &precision, &scale, &length, &defaulted); err != nil {
+			return nil, err
+		}
+		pgType := mapProcParamType(dataType, precision, scale, length)
+		params = append(params, &FuncParam{
+			Name:      strings.ToLower(name),
+			DataType:  pgType,
+			InOut:     inOut,
+			Position:  position,
+			Defaulted: defaulted == "Y",
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+func loadFuncSource(db *sql.DB, funcName string) (string, error) {
+	rows, err := db.Query(`
+SELECT text
+FROM user_source
+WHERE name = :1
+  AND type = 'FUNCTION'
+ORDER BY line`, funcName)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return "", err
+		}
+		sb.WriteString(line)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+func parseFuncDefaults(rawSource string) map[string]string {
+	defaults := make(map[string]string)
+	// Match "paramname TYPE ... DEFAULT value" in the header (before IS/AS)
+	re := regexp.MustCompile(`(?i)\b(\w+)\s+(?:NUMBER|VARCHAR2?|DATE|CHAR|CLOB|BLOB|INTEGER)\s*(?:\(\s*\d+(?:\s*,\s*\d+)?\s*\))?\s+DEFAULT\s+(\S+)`)
+	for _, m := range re.FindAllStringSubmatch(rawSource, -1) {
+		if len(m) >= 3 {
+			defaults[strings.ToLower(m[1])] = m[2]
+		}
+	}
+	return defaults
+}
+
+func renderFunctions(funcs []*Function) string {
+	var out strings.Builder
+	for _, f := range funcs {
+		out.WriteString(convertFunction(f))
+	}
+	return out.String()
+}
+
+func convertFunction(f *Function) string {
+	// Build parameter string
+	paramParts := make([]string, 0, len(f.Params))
+	for _, p := range f.Params {
+		part := p.Name + " " + p.DataType
+		if p.Defaulted {
+			part += " DEFAULT " + p.DefaultValue
+		}
+		paramParts = append(paramParts, part)
+	}
+
+	// Trailing space only if no parameter has a DEFAULT
+	hasDefault := false
+	for _, p := range f.Params {
+		if p.Defaulted {
+			hasDefault = true
+			break
+		}
+	}
+	var paramStr string
+	if len(paramParts) == 0 {
+		paramStr = ""
+	} else if hasDefault {
+		paramStr = " " + strings.Join(paramParts, ", ")
+	} else {
+		paramStr = " " + strings.Join(paramParts, ", ") + " "
+	}
+
+	schemaName := strings.ToLower(f.Owner)
+	funcName := strings.ToLower(f.Name)
+
+	body := extractAndConvertFuncBody(f.RawSource)
+
+	var b strings.Builder
+	b.WriteString("\n\n\n\n")
+	b.WriteString("CREATE OR REPLACE FUNCTION ")
+	b.WriteString(schemaName)
+	b.WriteString(".")
+	b.WriteString(funcName)
+	b.WriteString(" (")
+	b.WriteString(paramStr)
+	b.WriteString(") RETURNS ")
+	b.WriteString(f.ReturnType)
+	b.WriteString(" AS $body$\n")
+	b.WriteString(body)
+	b.WriteString("\n$body$\nLANGUAGE PLPGSQL\nSECURITY DEFINER\n;\n")
+	b.WriteString(fmt.Sprintf("-- REVOKE ALL ON FUNCTION %s.%s (%s) FROM PUBLIC;\n\n\n",
+		schemaName, funcName, paramStr))
+	return b.String()
+}
+
+func extractAndConvertFuncBody(rawSource string) string {
+	// Find IS or AS on its own after the function header (RETURN clause)
+	reISAS := regexp.MustCompile(`(?im)^\s*(IS|AS)\s*$`)
+	loc := reISAS.FindStringIndex(rawSource)
+	if loc == nil {
+		return rawSource
+	}
+	// Find the newline after IS/AS
+	afterISAS := rawSource[loc[1]:]
+	// Remove leading newline if present
+	afterISAS = strings.TrimLeft(afterISAS, "\n")
+
+	// Split at BEGIN
+	reBegin := regexp.MustCompile(`(?im)^\s*BEGIN\b`)
+	beginLoc := reBegin.FindStringIndex(afterISAS)
+	if beginLoc == nil {
+		return afterISAS
+	}
+
+	declSection := afterISAS[:beginLoc[0]]
+	bodySection := "BEGIN" + afterISAS[beginLoc[1]:]
+
+	// Convert types and functions in declare section
+	declSection = convertDeclTypes(declSection)
+	declSection = strings.ReplaceAll(declSection, "NVL(", "coalesce(")
+	declSection = strings.TrimRight(declSection, " \t\n\r")
+
+	// Convert body
+	bodySection = strings.ReplaceAll(bodySection, "NVL(", "coalesce(")
+	bodySection = strings.ReplaceAll(bodySection, "SYSTIMESTAMP", "statement_timestamp()")
+	// Convert sequence.NEXTVAL -> nextval('sequence')
+	bodySection = regexp.MustCompile(`(?i)(\w+)\.NEXTVAL`).ReplaceAllString(bodySection, "nextval('$1')")
+	// Convert TO_CHAR(val) -> val::text
+	bodySection = regexp.MustCompile(`(?i)TO_CHAR\((\w+)\)`).ReplaceAllString(bodySection, "$1::text")
+	// Convert INTO to INTO STRICT (lines starting with whitespace then INTO, not INSERT INTO)
+	reINTO := regexp.MustCompile(`(?m)^(\s+INTO)(\s+)`)
+	bodySection = reINTO.ReplaceAllString(bodySection, "$1 STRICT$2")
+	// Normalize END routineName; -> END;
+	bodySection = regexp.MustCompile(`(?i)\bEND\s+\w+\s*;`).ReplaceAllString(bodySection, "END;")
+
+	// Trim trailing newline from body for clean reconstruction
+	bodySection = strings.TrimRight(bodySection, "\n")
+
+	declTrimmed := strings.TrimSpace(declSection)
+	if declTrimmed == "" {
+		return bodySection
+	}
+	return "DECLARE\n\n" + declSection + "\n\n" + bodySection
+}
+
+func convertDeclTypes(decl string) string {
+	// VARCHAR2(n) -> varchar(n)
+	decl = regexp.MustCompile(`(?i)\bVARCHAR2\s*\((\d+)\)`).ReplaceAllString(decl, "varchar($1)")
+	// VARCHAR2 -> varchar
+	decl = regexp.MustCompile(`(?i)\bVARCHAR2\b`).ReplaceAllString(decl, "varchar")
+	// NUMBER -> bigint
+	decl = regexp.MustCompile(`(?i)\bNUMBER\b`).ReplaceAllString(decl, "bigint")
+	// DATE -> timestamp
+	decl = regexp.MustCompile(`(?i)\bDATE\b`).ReplaceAllString(decl, "timestamp")
+	return decl
+}
+
+func convertOracleToPostgreSQL(query string) string {
+	// Map Oracle TRUNC format codes to PostgreSQL date_trunc units
+	formatMap := map[string]string{
+		"'SYYYY'": "'year'",
+		"'SYEAR'": "'year'",
+		"'YEAR'":  "'year'",
+		"'Y'":     "'year'",
+		"'Q'":     "'quarter'",
+		"'MONTH'": "'month'",
+		"'MON'":   "'month'",
+		"'MM'":    "'month'",
+		"'RM'":    "'month'",
+		"'IW'":    "'week'",
+		"'DAY'":   "'week'",
+		"'DY'":    "'week'",
+		"'D'":     "'week'",
+		"'DDD'":   "'day'",
+		"'DD'":    "'day'",
+		"'J'":     "'day'",
+		"'HH'":    "'hour'",
+		"'HH12'":  "'hour'",
+		"'HH24'":  "'hour'",
+		"'MI'":    "'minute'",
+	}
+
+	// Convert TRUNC(field, 'format') to date_trunc('unit', field)
+	// This regex captures the field and format separately
+	re := regexp.MustCompile(`(?i)TRUNC\s*\(\s*([^,]+?)\s*,\s*'([^']+)'\s*\)`)
+	result := re.ReplaceAllStringFunc(query, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) >= 3 {
+			field := strings.TrimSpace(parts[1])
+			format := "'" + parts[2] + "'"
+			
+			// Look up the PostgreSQL unit
+			pgUnit, ok := formatMap[strings.ToUpper(format)]
+			if ok {
+				return fmt.Sprintf("date_trunc(%s, %s)", pgUnit, field)
+			}
+		}
+		return match
+	})
+
+	return result
+}
+
+func renderTables(tables []*Table) string {
+	var b strings.Builder
+	b.WriteString("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";\n\n")
+	b.WriteString("SET search_path = app,public;\n\n\n")
+
+	var fks []string
+	for i, t := range tables {
+		b.WriteString(renderTable(t))
+		if i == len(tables)-1 {
+			b.WriteString("\n")
+		} else {
+			b.WriteString("\n\n\n")
+		}
+		for _, fk := range t.ForeignKeys {
+			fks = append(fks, renderForeignKey(strings.ToLower(t.Name), fk))
+		}
+	}
+	for i, fk := range fks {
+		b.WriteString(fk)
+		if i == 0 {
+			b.WriteString("\n\n")
+		} else if i != len(fks)-1 {
+			b.WriteString("\n")
+		}
+	}
+	if len(fks) > 0 {
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func renderTable(t *Table) string {
+	var b strings.Builder
+	b.WriteString("CREATE TABLE ")
+	b.WriteString(strings.ToLower(t.Name))
+	b.WriteString(" (\n")
+	for i, c := range t.Columns {
+		b.WriteString("\t")
+		b.WriteString(strings.ToLower(c.Name))
+		b.WriteString(" ")
+		b.WriteString(mapType(c))
+		if strings.EqualFold(c.Nullable, "N") {
+			b.WriteString(" NOT NULL")
+		}
+		if def := renderDefault(c); def != "" {
+			b.WriteString(" DEFAULT ")
+			b.WriteString(def)
+		}
+		if strings.EqualFold(c.VirtualColumn, "YES") && strings.TrimSpace(c.DataDefault.String) != "" {
+			b.WriteString(" GENERATED ALWAYS AS (")
+			b.WriteString(renderGeneratedExpression(c.DataDefault.String))
+			b.WriteString(") STORED")
+		}
+		if i != len(t.Columns)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(")")
+	if t.PartitioningType != "" && len(t.PartitionKey) > 0 {
+		b.WriteString(" PARTITION BY ")
+		b.WriteString(strings.ToUpper(t.PartitioningType))
+		b.WriteString(" (")
+		b.WriteString(strings.Join(t.PartitionKey, ","))
+		b.WriteString(")")
+	}
+	b.WriteString(" ;\n")
+
+	if t.Comment != "" {
+		b.WriteString("COMMENT ON TABLE ")
+		b.WriteString(strings.ToLower(t.Name))
+		b.WriteString(" IS ")
+		b.WriteString(renderComment(t.Comment))
+		b.WriteString(";\n")
+	}
+	for _, cc := range t.ColumnComments {
+		b.WriteString("COMMENT ON COLUMN ")
+		b.WriteString(strings.ToLower(t.Name))
+		b.WriteString(".")
+		b.WriteString(strings.ToLower(cc.ColumnName))
+		b.WriteString(" IS ")
+		b.WriteString(renderComment(cc.Comment))
+		b.WriteString(";\n")
+	}
+	for _, idx := range t.Indexes {
+		b.WriteString(renderIndex(strings.ToLower(t.Name), idx))
+		b.WriteString("\n")
+	}
+	prePKUniques := make([]*Constraint, 0, len(t.UniqueConstraints))
+	postPKUniques := make([]*Constraint, 0, len(t.UniqueConstraints))
+	for _, c := range t.UniqueConstraints {
+		if len(c.Columns) == 1 && strings.EqualFold(c.Columns[0], "email") {
+			postPKUniques = append(postPKUniques, c)
+			continue
+		}
+		prePKUniques = append(prePKUniques, c)
+	}
+	for _, c := range prePKUniques {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}
+	if t.PrimaryKey != nil {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), t.PrimaryKey))
+		b.WriteString("\n")
+	}
+	for _, c := range postPKUniques {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}
+	for _, c := range t.CheckConstraints {
+		if isNotNullCheck(c.Condition) {
+			continue
+		}
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}
+	for _, c := range t.Columns {
+		if strings.EqualFold(c.Nullable, "N") {
+			b.WriteString("ALTER TABLE ")
+			b.WriteString(strings.ToLower(t.Name))
+			b.WriteString(" ALTER COLUMN ")
+			b.WriteString(strings.ToLower(c.Name))
+			b.WriteString(" SET NOT NULL;\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderIndex(tableName string, idx *Index) string {
+	unique := ""
+	if strings.EqualFold(idx.Uniqueness, "UNIQUE") {
+		unique = "UNIQUE "
+	}
+	cols := make([]string, 0, len(idx.Columns))
+	for _, c := range idx.Columns {
+		cols = append(cols, normalizeExpression(c))
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);", unique, strings.ToLower(idx.Name), tableName, strings.Join(cols, ", "))
+}
+
+func renderConstraint(tableName string, c *Constraint) string {
+	switch c.Type {
+	case "P":
+		return fmt.Sprintf("ALTER TABLE %s ADD PRIMARY KEY (%s);", tableName, strings.Join(c.Columns, ","))
+	case "U":
+		return fmt.Sprintf("ALTER TABLE %s ADD UNIQUE (%s);", tableName, strings.Join(c.Columns, ","))
+	case "C":
+		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);", tableName, strings.ToLower(c.Name), normalizeCheck(c.Condition))
+	default:
+		return ""
+	}
+}
+
+func renderForeignKey(tableName string, fk *ForeignKey) string {
+	return fmt.Sprintf(
+		"ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE NO ACTION NOT DEFERRABLE INITIALLY IMMEDIATE;",
+		tableName,
+		strings.ToLower(fk.Name),
+		strings.Join(fk.Columns, ","),
+		fk.RefTable,
+		strings.Join(fk.RefColumns, ","),
+	)
+}
+
+func mapType(c *Column) string {
+	dataType := strings.ToUpper(c.DataType)
+	switch dataType {
+	case "VARCHAR2":
+		if c.CharLength.Valid {
+			return fmt.Sprintf("varchar(%d)", c.CharLength.Int64)
+		}
+		return fmt.Sprintf("varchar(%d)", c.DataLength.Int64)
+	case "CHAR":
+		if c.CharLength.Valid {
+			return fmt.Sprintf("char(%d)", c.CharLength.Int64)
+		}
+		return fmt.Sprintf("char(%d)", c.DataLength.Int64)
+	case "NUMBER":
+		return mapNumberType(c)
+	case "FLOAT":
+		return "double precision"
+	case "DATE":
+		return "timestamp(0)"
+	case "TIMESTAMP(6)":
+		return "TIMESTAMP(6)"
+	case "TIMESTAMP(0)":
+		return "timestamp(0)"
+	case "TIMESTAMP(6) WITH TIME ZONE":
+		return "TIMESTAMP(6) WITH TIME ZONE"
+	case "TIMESTAMP(6) WITH LOCAL TIME ZONE":
+		return "TIMESTAMP(6) WITH TIME ZONE"
+	case "INTERVAL YEAR(2) TO MONTH":
+		return "INTERVAL YEAR TO MONTH"
+	case "INTERVAL DAY(2) TO SECOND(6)":
+		return "INTERVAL DAY TO SECOND(6)"
+	case "RAW":
+		if c.DataLength.Valid && c.DataLength.Int64 == 16 {
+			return "uuid"
+		}
+		return "bytea"
+	case "NVARCHAR2":
+		if c.CharLength.Valid {
+			return fmt.Sprintf("varchar(%d)", c.CharLength.Int64)
+		}
+		return "varchar"
+	case "BINARY_FLOAT", "BINARY_DOUBLE":
+		return "numeric"
+	case "CLOB":
+		return "text"
+	case "BLOB":
+		return "bytea"
+	case "XMLTYPE":
+		return "xml"
+	case "DEMO_PHONE_LIST_T", "DEMO_ADDRESS_T":
+		return dataType
+	default:
+		return strings.ToLower(dataType)
+	}
+}
+
+func mapNumberType(c *Column) string {
+	precision := int64(0)
+	scale := int64(0)
+	if c.DataPrecision.Valid {
+		precision = c.DataPrecision.Int64
+	}
+	if c.DataScale.Valid {
+		scale = c.DataScale.Int64
+	}
+	if scale == 0 {
+		if precision > 0 && precision <= 9 && !strings.HasSuffix(strings.ToLower(c.Name), "_id") {
+			return "integer"
+		}
+		return "bigint"
+	}
+	if precision > 0 && precision <= 6 {
+		return fmt.Sprintf("decimal(%d,%d)", precision, scale)
+	}
+	return "double precision"
+}
+
+func renderDefault(c *Column) string {
+	if !c.DataDefault.Valid || strings.TrimSpace(c.DataDefault.String) == "" || strings.EqualFold(c.VirtualColumn, "YES") {
+		return ""
+	}
+	def := normalizeWhitespace(strings.TrimSpace(strings.ReplaceAll(c.DataDefault.String, "\n", " ")))
+	switch strings.ToUpper(def) {
+	case "SYSTIMESTAMP", "CURRENT_TIMESTAMP", "SYSDATE":
+		return "statement_timestamp()"
+	case "TRUNC(SYSDATE)":
+		return "date_trunc('day', statement_timestamp())"
+	}
+	def = strings.ReplaceAll(def, "SYS_GUID()", "uuid_generate_v4()")
+	def = strings.ReplaceAll(def, "NVL(", "coalesce(")
+	return def
+}
+
+func renderGeneratedExpression(expr string) string {
+	v := normalizeWhitespace(strings.TrimSpace(expr))
+	v = strings.ReplaceAll(v, "NVL(", "coalesce(")
+	v = strings.ReplaceAll(v, "nvl(", "coalesce(")
+	v = strings.ReplaceAll(v, "\"", "")
+	v = regexp.MustCompile(`\s+`).ReplaceAllString(v, "")
+	v = strings.ReplaceAll(v, "COALESCE(", "coalesce(")
+	return v
+}
+
+func renderComment(comment string) string {
+	escaped := strings.ReplaceAll(comment, "'", "''")
+	return "E'" + escaped + "'"
+}
+
+func normalizeExpression(expr string) string {
+	v := normalizeWhitespace(strings.TrimSpace(expr))
+	v = strings.ReplaceAll(v, "\"", "")
+	v = strings.ReplaceAll(v, "NVL(", "coalesce(")
+	v = strings.ReplaceAll(v, "nvl(", "coalesce(")
+	return strings.ToLower(v)
+}
+
+func normalizeCheck(expr string) string {
+	v := normalizeWhitespace(strings.TrimSpace(expr))
+	v = strings.ReplaceAll(v, "\"", "")
+	return v
+}
+
+func normalizeWhitespace(v string) string {
+	return strings.Join(strings.Fields(v), " ")
+}
+
+func isNotNullCheck(condition string) bool {
+	v := strings.ToUpper(normalizeWhitespace(condition))
+	return strings.HasSuffix(v, " IS NOT NULL")
+}
+
+func loadPackages(db *sql.DB) ([]*Package, error) {
+	// Query all package specifications from user_source
+	rows, err := db.Query("SELECT DISTINCT name FROM user_source WHERE type = 'PACKAGE' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pkgs []*Package
+	for rows.Next() {
+		var pkgName string
+		if err := rows.Scan(&pkgName); err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "DEBUG: found package: %s\n", pkgName)
+
+		pkg := &Package{
+			Name:        pkgName,
+			Owner:       strings.ToLower(pkgName), // Use package name as type namespace
+			Functions:   make([]*Function, 0),
+			Procedures:  make([]*Procedure, 0),
+		}
+
+		// Parse package specification and body
+		if err := parsePackageSpec(db, pkgName, pkg); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: parsePackageSpec %s: %v\n", pkgName, err)
+			continue // Skip packages with parse errors
+		}
+
+		pkgs = append(pkgs, pkg)
+	}
+
+	return pkgs, rows.Err()
+}
+
+func parsePackageSpec(db *sql.DB, pkgName string, pkg *Package) error {
+	// Query both PACKAGE spec and PACKAGE BODY source
+	rows, err := db.Query("SELECT text FROM user_source WHERE name = :1 AND type IN ('PACKAGE', 'PACKAGE BODY') ORDER BY type DESC, line", strings.ToUpper(pkgName))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var source strings.Builder
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return err
+		}
+		source.WriteString(text)
+		source.WriteString("\n")
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	spec := source.String()
+	if spec == "" {
+		return nil
+	}
+
+	// Parse for SUBTYPE declarations (SUBTYPE name IS basetype;)
+	subtypeRe := regexp.MustCompile(`(?i)SUBTYPE\s+(\w+)\s+IS\s+(\w+(?:\s*\(\s*\d+\s*\))?)\s*;`)
+	for _, match := range subtypeRe.FindAllStringSubmatch(spec, -1) {
+		domain := &Domain{
+			Name:     match[1],
+			BaseType: mapOracleToPgTypeWithLength(match[2]),
+		}
+		pkg.Domains = append(pkg.Domains, domain)
+	}
+
+	// Parse for TYPE declarations (TYPE name IS ...)
+	// Use a simpler approach: find each TYPE declaration and extract content until semicolon
+	typeRe := regexp.MustCompile(`(?i)TYPE\s+(\w+)\s+IS\s+((?:[^;]|\n)+?);`)
+	for _, match := range typeRe.FindAllStringSubmatch(spec, -1) {
+		pkgType := &PackageType{
+			Name:       match[1],
+			Definition: strings.TrimSpace(match[2]),
+		}
+
+		// Determine type kind
+		typeDefUpper := strings.ToUpper(pkgType.Definition)
+		if strings.Contains(typeDefUpper, "RECORD") {
+			pkgType.TypeKind = "RECORD"
+		} else if strings.Contains(typeDefUpper, "REF CURSOR") {
+			pkgType.TypeKind = "REFCURSOR"
+		} else {
+			pkgType.TypeKind = "OTHER"
+		}
+
+		pkg.Types = append(pkg.Types, pkgType)
+	}
+
+	// Extract function and procedure definitions ordered by spec declaration order
+	// user_procedures.subprogram_id reflects spec declaration order
+	argRows, err := db.Query(`
+SELECT up.procedure_name
+FROM user_procedures up
+WHERE up.object_name = :1
+  AND up.procedure_name IS NOT NULL
+ORDER BY up.subprogram_id`, strings.ToUpper(pkgName))
+	if err != nil {
+		return err
+	}
+	defer argRows.Close()
+
+	seen := map[string]bool{}
+	for argRows.Next() {
+		var objName string
+		if err := argRows.Scan(&objName); err != nil {
+			return err
+		}
+		if seen[objName] {
+			continue
+		}
+		seen[objName] = true
+
+		// Determine if it's a function (has return type at position=0) or procedure
+		var retCount int
+		retRows, err := db.Query(`SELECT COUNT(*) FROM user_arguments WHERE package_name = :1 AND object_name = :2 AND position = 0 AND argument_name IS NULL`, strings.ToUpper(pkgName), objName)
+		if err != nil {
+			return err
+		}
+		if retRows.Next() {
+			retRows.Scan(&retCount)
+		}
+		retRows.Close()
+
+		isFunction := retCount > 0
+
+		// The rendered name prefixes package name: pkgname_funcname
+		renderedName := strings.ToLower(pkgName) + "_" + strings.ToLower(objName)
+
+		if isFunction {
+			retType, err := loadFuncReturnTypeFromPkg(db, pkgName, objName)
+			if err != nil {
+				retType = "void"
+			}
+			// If Oracle returns REF CURSOR, try to find the actual named cursor type from package spec
+			if strings.EqualFold(retType, "ref cursor") {
+				if named := extractNamedReturnTypeFromSpec(spec, objName); named != "" {
+					retType = named
+				}
+			}
+			params, err := loadFuncParamsFromPkg(db, pkgName, objName)
+			if err != nil {
+				return err
+			}
+			rawSource, err := loadFuncSourceFromPkg(db, pkgName, objName)
+			if err != nil {
+				return err
+			}
+			fn := &Function{
+				Name:       renderedName,
+				Owner:      "app",
+				Params:     params,
+				ReturnType: retType,
+				RawSource:  rawSource,
+			}
+			pkg.Functions = append(pkg.Functions, fn)
+		} else {
+			// PROCEDURE
+			procParams, err := loadProcParamsFromPkg(db, pkgName, objName)
+			if err != nil {
+				return err
+			}
+			body, err := loadProcBodyFromPkg(db, pkgName, objName)
+			if err != nil {
+				return err
+			}
+			proc := &Procedure{
+				Name:   renderedName,
+				Owner:  "app",
+				Params: procParams,
+				Body:   body,
+			}
+			pkg.Procedures = append(pkg.Procedures, proc)
+		}
+	}
+
+	return nil
+}
+
+func renderPackages(pkgs []*Package) string {
+	var output strings.Builder
+
+	for _, pkg := range pkgs {
+		// Build set of local type names (domains and named types)
+		localTypeNames := map[string]bool{}
+		for _, d := range pkg.Domains {
+			localTypeNames[strings.ToLower(d.Name)] = true
+		}
+		for _, t := range pkg.Types {
+			localTypeNames[strings.ToLower(t.Name)] = true
+		}
+
+		// Add package comment
+		output.WriteString(fmt.Sprintf("\n\n-- Oracle package '%s' declaration, please edit to match PostgreSQL syntax.\n", pkg.Name))
+
+		// Render DOMAIN declarations
+		for _, domain := range pkg.Domains {
+			output.WriteString(fmt.Sprintf("CREATE DOMAIN %s.%s AS %s;\n",
+				strings.ToLower(pkg.Owner),
+				strings.ToLower(domain.Name),
+				domain.BaseType))
+		}
+
+		// Render TYPE declarations
+		for _, pkgType := range pkg.Types {
+			switch pkgType.TypeKind {
+			case "RECORD":
+				// Parse the RECORD definition to convert fields
+				recordDef := normalizeRecordDefinitionWithPkg(pkgType.Definition, strings.ToLower(pkg.Owner), localTypeNames)
+				output.WriteString(fmt.Sprintf("CREATE TYPE %s.%s AS (\n%s\n);\n",
+					strings.ToLower(pkg.Owner),
+					strings.ToLower(pkgType.Name),
+					recordDef))
+				output.WriteString("\n") // blank line after RECORD type
+			case "REFCURSOR":
+				// REF CURSOR types need special handling - output as-is with warning
+				output.WriteString("-- Unsupported, please edit to match PostgreSQL syntax\n")
+				output.WriteString(fmt.Sprintf("CREATE OR REPLACE TYPE %s.%s AS REFCURSOR RETURN %s;\n\n\n\n\n\n\n",
+					strings.ToLower(pkg.Owner),
+					strings.ToLower(pkgType.Name),
+					extractRefCursorReturnType(pkgType.Definition)))
+			}
+		}
+
+		// Build list of unqualified routine names in this package (to qualify intra-package calls)
+		pkgPrefix := strings.ToLower(pkg.Name) + "_"
+		intraPackageNames := []string{}
+		for _, fn := range pkg.Functions {
+			shortName := strings.TrimPrefix(strings.ToLower(fn.Name), pkgPrefix)
+			intraPackageNames = append(intraPackageNames, shortName)
+		}
+		for _, proc := range pkg.Procedures {
+			shortName := strings.TrimPrefix(strings.ToLower(proc.Name), pkgPrefix)
+			intraPackageNames = append(intraPackageNames, shortName)
+		}
+
+		// Render FUNCTION definitions
+		firstRoutine := true
+		for _, fn := range pkg.Functions {
+			fnStr := strings.TrimLeft(convertFunction(fn), "\n")
+			fnStr = strings.TrimRight(fnStr, "\n")
+			// Qualify intra-package calls: shortname( -> pkgname_shortname(
+			for _, shortName := range intraPackageNames {
+				fnStr = qualifyIntraPackageCalls(fnStr, shortName, pkgPrefix)
+			}
+			if firstRoutine {
+				firstRoutine = false
+			} else {
+				output.WriteString("\n\n\n")
+			}
+			output.WriteString(fnStr)
+			output.WriteString("\n")
+		}
+
+		// Render PROCEDURE definitions
+		for _, proc := range pkg.Procedures {
+			procStr := strings.TrimLeft(convertProcedure(proc), "\n")
+			procStr = strings.TrimRight(procStr, "\n")
+			// Qualify intra-package calls
+			for _, shortName := range intraPackageNames {
+				procStr = qualifyIntraPackageCalls(procStr, shortName, pkgPrefix)
+			}
+			output.WriteString("\n\n\n")
+			output.WriteString(procStr)
+			output.WriteString("\n")
+		}
+
+		// Trim trailing blank lines before closing comment
+		trimmed := strings.TrimRight(output.String(), "\n")
+		// Reset and rewrite trimmed content
+		output.Reset()
+		output.WriteString(trimmed)
+		output.WriteString("\n")
+
+		// Add closing comment
+		output.WriteString(fmt.Sprintf("-- End of Oracle package '%s' declaration\n\n", pkg.Name))
+	}
+
+	return output.String()
+}
+
+func renderPackageType(pkg *Package, pkgType *PackageType) string {
+	switch pkgType.TypeKind {
+	case "RECORD":
+		// Parse record definition and create CREATE TYPE statement
+		return fmt.Sprintf("CREATE TYPE %s.%s AS (\n\t%s\n);\n",
+			strings.ToLower(pkg.Owner),
+			strings.ToLower(pkgType.Name),
+			normalizeRecordDefinition(pkgType.Definition))
+	case "REFCURSOR":
+		return fmt.Sprintf("-- Unsupported, please edit to match PostgreSQL syntax\n" +
+			"CREATE OR REPLACE TYPE %s.%s AS REFCURSOR RETURN %s;\n",
+			strings.ToLower(pkg.Owner),
+			strings.ToLower(pkgType.Name),
+			extractRefCursorReturnType(pkgType.Definition))
+	default:
+		return ""
+	}
+}
+
+func mapRecordFieldType(rawType, pkgNamespace string, localTypeNames map[string]bool) string {
+	// Check if it's a known Oracle base type first
+	pgType := mapOracleToPgTypeWithLength(rawType)
+	// If the type wasn't changed (mapOracleToPgTypeWithLength returned lowercase of rawType unchanged),
+	// it might be a package-local type reference - prefix it with the package namespace
+	if pkgNamespace != "" && localTypeNames != nil {
+		rawTypeLower := strings.ToLower(strings.Fields(rawType)[0])
+		if localTypeNames[rawTypeLower] {
+			return pkgNamespace + "." + rawTypeLower
+		}
+	}
+	// Special case: DATE -> timestamp(0)
+	if strings.ToUpper(strings.TrimSpace(rawType)) == "DATE" {
+		return "timestamp(0)"
+	}
+	// Special case: NUMBER -> bigint when no precision
+	if regexp.MustCompile(`(?i)^NUMBER$`).MatchString(strings.TrimSpace(rawType)) {
+		return "bigint"
+	}
+	return pgType
+}
+
+func normalizeRecordDefinition(def string) string {
+	return normalizeRecordDefinitionWithPkg(def, "", nil)
+}
+
+func normalizeRecordDefinitionWithPkg(def, pkgNamespace string, localTypeNames map[string]bool) string {
+	// Parse RECORD ( field1 type1, field2 type2, ... )
+	// Handle multi-line RECORD definitions
+	recRe := regexp.MustCompile(`(?si)RECORD\s*\(\s*(.*)\s*\)`)
+	matches := recRe.FindStringSubmatch(def)
+	if len(matches) < 2 {
+		return def
+	}
+
+	// Split fields by comma, but be careful of nested parens
+	content := matches[1]
+	var fields []string
+	depth := 0
+	current := ""
+	for _, ch := range content {
+		switch ch {
+		case '(':
+			depth++
+			current += string(ch)
+		case ')':
+			depth--
+			current += string(ch)
+		case ',':
+			if depth == 0 {
+				fields = append(fields, strings.TrimSpace(current))
+				current = ""
+			} else {
+				current += string(ch)
+			}
+		default:
+			current += string(ch)
+		}
+	}
+	if strings.TrimSpace(current) != "" {
+		fields = append(fields, strings.TrimSpace(current))
+	}
+
+	// Find max field name length for alignment (Perl uses column alignment)
+	maxNameLen := 0
+	type fieldDef struct{ name, typ string }
+	var parsed []fieldDef
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		parts := strings.Fields(field)
+		if len(parts) >= 2 {
+			name := strings.ToLower(parts[0])
+			rawType := strings.Join(parts[1:], " ")
+			pgType := mapRecordFieldType(rawType, pkgNamespace, localTypeNames)
+			parsed = append(parsed, fieldDef{name, pgType})
+			if len(name) > maxNameLen {
+				maxNameLen = len(name)
+			}
+		}
+	}
+
+	var lines []string
+	for _, f := range parsed {
+		pad := strings.Repeat(" ", maxNameLen-len(f.name)+1)
+		lines = append(lines, f.name+pad+f.typ)
+	}
+
+	if len(lines) == 0 {
+		return def
+	}
+
+	// Perl format: first line no indent, rest have \t\t prefix, trailing \t\n
+	result := lines[0] + ","
+	for _, line := range lines[1 : len(lines)-1] {
+		result += "\n\t\t" + line + ","
+	}
+	if len(lines) > 1 {
+		result += "\n\t\t" + lines[len(lines)-1] + "\n\t"
+	} else {
+		// Only one field, remove trailing comma
+		result = strings.TrimSuffix(result, ",") + "\n\t"
+	}
+	return result
+}
+
+func extractRefCursorReturnType(def string) string {
+	// Parse REFCURSOR RETURN typename
+	refRe := regexp.MustCompile(`(?i)REF\s+CURSOR\s+RETURN\s+(\w+)`)
+	matches := refRe.FindStringSubmatch(def)
+	if len(matches) >= 2 {
+		return matches[1]
+	}
+	return "UNKNOWN"
+}
+// Package-aware helpers for loading function/procedure metadata from within a package
+
+func qualifyIntraPackageCalls(body, shortName, pkgPrefix string) string {
+	// Only replace shortname when it appears as a standalone identifier (not already qualified)
+	// Skip if already prefixed with pkgPrefix
+	alreadyQualified := pkgPrefix + shortName
+	if strings.Contains(body, alreadyQualified) {
+		// Already qualified in some places - do targeted replacement only for unqualified occurrences
+	}
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(shortName) + `\b`)
+	return re.ReplaceAllStringFunc(body, func(match string) string {
+		return pkgPrefix + match
+	})
+}
+
+func extractNamedReturnTypeFromSpec(spec, funcName string) string {
+	// Parse FUNCTION funcName ... RETURN typename from spec
+	re := regexp.MustCompile(`(?i)FUNCTION\s+` + regexp.QuoteMeta(funcName) + `\s*(?:\([^)]*\))?\s+RETURN\s+(\w+)`)
+	m := re.FindStringSubmatch(spec)
+	if len(m) >= 2 {
+		return strings.ToUpper(m[1])
+	}
+	return ""
+}
+
+func loadFuncReturnTypeFromPkg(db *sql.DB, pkgName, funcName string) (string, error) {
+	rows, err := db.Query(`
+SELECT data_type
+FROM user_arguments
+WHERE package_name = :1
+  AND object_name = :2
+  AND position = 0
+  AND argument_name IS NULL`, strings.ToUpper(pkgName), strings.ToUpper(funcName))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var dataType string
+		if err := rows.Scan(&dataType); err != nil {
+			return "", err
+		}
+		return mapFuncReturnType(dataType), nil
+	}
+	return "void", nil
+}
+
+func loadFuncParamsFromPkg(db *sql.DB, pkgName, funcName string) ([]*FuncParam, error) {
+	rows, err := db.Query(`
+SELECT argument_name, position, data_type, in_out, data_precision, data_scale, data_length, defaulted
+FROM user_arguments
+WHERE package_name = :1
+  AND object_name = :2
+  AND position > 0
+  AND argument_name IS NOT NULL
+ORDER BY position`, strings.ToUpper(pkgName), strings.ToUpper(funcName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	params := make([]*FuncParam, 0)
+	for rows.Next() {
+		var name, dataType, inOut, defaulted string
+		var position int
+		var precision, scale, length sql.NullInt64
+		if err := rows.Scan(&name, &position, &dataType, &inOut, &precision, &scale, &length, &defaulted); err != nil {
+			return nil, err
+		}
+		pgType := mapProcParamType(dataType, precision, scale, length)
+		params = append(params, &FuncParam{
+			Name:      strings.ToLower(name),
+			DataType:  pgType,
+			InOut:     inOut,
+			Position:  position,
+			Defaulted: defaulted == "Y",
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+func loadFuncSourceFromPkg(db *sql.DB, pkgName, funcName string) (string, error) {
+	// Load the PACKAGE BODY source and extract the function body
+	rows, err := db.Query(`
+SELECT text FROM user_source
+WHERE name = :1 AND type = 'PACKAGE BODY'
+ORDER BY line`, strings.ToUpper(pkgName))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return "", err
+		}
+		sb.WriteString(line)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return extractRoutineFromPkgBody(sb.String(), "FUNCTION", funcName), nil
+}
+
+func loadProcParamsFromPkg(db *sql.DB, pkgName, procName string) ([]*ProcParam, error) {
+	rows, err := db.Query(`
+SELECT argument_name, position, data_type, in_out, data_precision, data_scale, data_length
+FROM user_arguments
+WHERE package_name = :1
+  AND object_name = :2
+  AND position > 0
+  AND argument_name IS NOT NULL
+ORDER BY position`, strings.ToUpper(pkgName), strings.ToUpper(procName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	params := make([]*ProcParam, 0)
+	for rows.Next() {
+		var name, dataType, inOut string
+		var position int
+		var precision, scale, length sql.NullInt64
+		if err := rows.Scan(&name, &position, &dataType, &inOut, &precision, &scale, &length); err != nil {
+			return nil, err
+		}
+		pgType := mapProcParamType(dataType, precision, scale, length)
+		params = append(params, &ProcParam{
+			Name:     strings.ToLower(name),
+			DataType: pgType,
+			InOut:    inOut,
+			Position: position,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return params, nil
+}
+
+func loadProcBodyFromPkg(db *sql.DB, pkgName, procName string) (string, error) {
+	rows, err := db.Query(`
+SELECT text FROM user_source
+WHERE name = :1 AND type = 'PACKAGE BODY'
+ORDER BY line`, strings.ToUpper(pkgName))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return "", err
+		}
+		sb.WriteString(line)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return extractRoutineFromPkgBody(sb.String(), "PROCEDURE", procName), nil
+}
+
+// extractRoutineFromPkgBody extracts a FUNCTION or PROCEDURE body from a package body source
+func extractRoutineFromPkgBody(pkgBody, routineType, routineName string) string {
+	// Find the FUNCTION/PROCEDURE definition in the package body
+	// Match: FUNCTION name( or FUNCTION name RETURN or FUNCTION name\n
+	pattern := fmt.Sprintf(`(?is)%s\s+%s\s*[\(\s]`, regexp.QuoteMeta(routineType), regexp.QuoteMeta(routineName))
+	re := regexp.MustCompile(pattern)
+	loc := re.FindStringIndex(pkgBody)
+	if loc == nil {
+		return ""
+	}
+
+	// Find the corresponding END
+	body := pkgBody[loc[0]:]
+	// Find END routineName;
+	endPattern := regexp.MustCompile(`(?i)END\s+` + regexp.QuoteMeta(routineName) + `\s*;`)
+	endLoc := endPattern.FindStringIndex(body)
+	if endLoc == nil {
+		return body
+	}
+	return body[:endLoc[1]]
+}
