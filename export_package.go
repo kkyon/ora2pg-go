@@ -368,7 +368,7 @@ func qualifyIntraPackageCalls(body, shortName, pkgPrefix string) string {
 }
 
 // renderPackages creates the export output for packages
-func renderPackages(pkgs []*Package) string {
+func renderPackages(pkgs []*Package, packageAsSchema bool) string {
 	var output strings.Builder
 
 	for _, pkg := range pkgs {
@@ -382,32 +382,70 @@ func renderPackages(pkgs []*Package) string {
 		}
 
 		// Add package comment with leading blank lines
-		output.WriteString(fmt.Sprintf("\n\n-- Oracle package '%s' declaration, please edit to match PostgreSQL syntax.\n", pkg.Name))
+		if packageAsSchema {
+			output.WriteString(fmt.Sprintf("\n\n-- Oracle package '%s' declaration, please edit to match PostgreSQL syntax.\n", pkg.Name))
+		} else {
+			output.WriteString(fmt.Sprintf("\n\n-- Oracle package '%s' converted to prefix-based functions (package_as_schema=false)\n", pkg.Name))
+		}
+
+		if packageAsSchema {
+			// SCHEMA MODE: Create schema for package
+			pname := strings.ToLower(pkg.Name)
+			output.WriteString(fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE;\n", pname))
+			output.WriteString(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;\n", pname))
+		}
 
 		// Render DOMAIN declarations
 		for _, domain := range pkg.Domains {
-			output.WriteString(fmt.Sprintf("CREATE DOMAIN %s.%s AS %s;\n",
-				strings.ToLower(pkg.Owner),
-				strings.ToLower(domain.Name),
-				domain.BaseType))
+			domainName := strings.ToLower(domain.Name)
+			if packageAsSchema {
+				output.WriteString(fmt.Sprintf("CREATE DOMAIN %s.%s AS %s;\n",
+					strings.ToLower(pkg.Name),
+					domainName,
+					domain.BaseType))
+			} else {
+				// PREFIX MODE: prefix domain with package name
+				prefixedName := strings.ToLower(pkg.Name) + "_" + domainName
+				output.WriteString(fmt.Sprintf("CREATE DOMAIN %s AS %s;\n",
+					prefixedName,
+					domain.BaseType))
+			}
 		}
 
 		// Render TYPE declarations
 		for _, pkgType := range pkg.Types {
+			typeName := strings.ToLower(pkgType.Name)
 			switch pkgType.TypeKind {
 			case "RECORD":
-				recordDef := normalizeRecordDefinitionWithPkg(pkgType.Definition, strings.ToLower(pkg.Owner), localTypeNames)
-				output.WriteString(fmt.Sprintf("CREATE TYPE %s.%s AS (\n%s\n);\n",
-					strings.ToLower(pkg.Owner),
-					strings.ToLower(pkgType.Name),
-					recordDef))
+				recordDef := normalizeRecordDefinitionWithPkg(pkgType.Definition, strings.ToLower(pkg.Name), localTypeNames)
+				if packageAsSchema {
+					output.WriteString(fmt.Sprintf("CREATE TYPE %s.%s AS (\n%s\n);\n",
+						strings.ToLower(pkg.Name),
+						typeName,
+						recordDef))
+				} else {
+					// PREFIX MODE: prefix type with package name
+					prefixedName := strings.ToLower(pkg.Name) + "_" + typeName
+					output.WriteString(fmt.Sprintf("CREATE TYPE %s AS (\n%s\n);\n",
+						prefixedName,
+						recordDef))
+				}
 				output.WriteString("\n")
 			case "REFCURSOR":
-				output.WriteString("-- Unsupported, please edit to match PostgreSQL syntax\n")
-				output.WriteString(fmt.Sprintf("CREATE OR REPLACE TYPE %s.%s AS REFCURSOR RETURN %s;\n\n\n\n\n\n\n",
-					strings.ToLower(pkg.Owner),
-					strings.ToLower(pkgType.Name),
-					extractRefCursorReturnType(pkgType.Definition)))
+				if packageAsSchema {
+					output.WriteString("-- Unsupported, please edit to match PostgreSQL syntax\n")
+					output.WriteString(fmt.Sprintf("CREATE OR REPLACE TYPE %s.%s AS REFCURSOR RETURN %s;\n\n\n\n\n\n\n",
+						strings.ToLower(pkg.Name),
+						typeName,
+						extractRefCursorReturnType(pkgType.Definition)))
+				} else {
+					// PREFIX MODE
+					prefixedName := strings.ToLower(pkg.Name) + "_" + typeName
+					output.WriteString("-- Unsupported REFCURSOR, please edit to match PostgreSQL syntax\n")
+					output.WriteString(fmt.Sprintf("CREATE OR REPLACE TYPE %s AS REFCURSOR RETURN %s;\n\n\n\n\n\n\n",
+						prefixedName,
+						extractRefCursorReturnType(pkgType.Definition)))
+				}
 			}
 		}
 
@@ -426,7 +464,7 @@ func renderPackages(pkgs []*Package) string {
 		// Render FUNCTION definitions
 		firstRoutine := true
 		for _, fn := range pkg.Functions {
-			fnStr := strings.TrimLeft(convertFunction(fn), "\n")
+			fnStr := strings.TrimLeft(convertPackageFunction(pkg, fn, packageAsSchema), "\n")
 			fnStr = strings.TrimRight(fnStr, "\n")
 			// Qualify intra-package calls
 			for _, shortName := range intraPackageNames {
@@ -443,7 +481,7 @@ func renderPackages(pkgs []*Package) string {
 
 		// Render PROCEDURE definitions
 		for _, proc := range pkg.Procedures {
-			procStr := strings.TrimLeft(convertProcedure(proc), "\n")
+			procStr := strings.TrimLeft(convertPackageProcedure(pkg, proc, packageAsSchema), "\n")
 			procStr = strings.TrimRight(procStr, "\n")
 			// Qualify intra-package calls
 			for _, shortName := range intraPackageNames {
@@ -465,6 +503,123 @@ func renderPackages(pkgs []*Package) string {
 	}
 
 	return output.String()
+}
+
+// convertPackageFunction renders a function for a package with appropriate naming (schema or prefix mode)
+func convertPackageFunction(pkg *Package, f *Function, packageAsSchema bool) string {
+	// Build parameter string
+	paramParts := make([]string, 0, len(f.Params))
+	for _, p := range f.Params {
+		part := p.Name + " " + p.DataType
+		if p.Defaulted {
+			part += " DEFAULT " + p.DefaultValue
+		}
+		paramParts = append(paramParts, part)
+	}
+
+	var paramStr string
+	if len(paramParts) == 0 {
+		paramStr = ""
+	} else {
+		hasDefault := false
+		for _, p := range f.Params {
+			if p.Defaulted {
+				hasDefault = true
+				break
+			}
+		}
+		if hasDefault {
+			paramStr = " " + strings.Join(paramParts, ", ")
+		} else {
+			paramStr = " " + strings.Join(paramParts, ", ") + " "
+		}
+	}
+
+	// Extract and minimally convert body
+	body := extractAndConvertFuncBody(f.RawSource)
+
+	var b strings.Builder
+	b.WriteString("\n\n\n\n")
+	b.WriteString("CREATE OR REPLACE FUNCTION ")
+
+	// Name depends on package mode
+	if packageAsSchema {
+		// Schema mode: schema.function_name
+		b.WriteString(strings.ToLower(pkg.Name))
+		b.WriteString(".")
+		b.WriteString(strings.ToLower(f.Name))
+	} else {
+		// Prefix mode: package_function_name
+		funcName := strings.ToLower(f.Name)
+		// Remove package prefix if already present
+		pkgPrefix := strings.ToLower(pkg.Name) + "_"
+		if strings.HasPrefix(funcName, pkgPrefix) {
+			b.WriteString(funcName)
+		} else {
+			b.WriteString(pkgPrefix)
+			b.WriteString(funcName)
+		}
+	}
+
+	b.WriteString(" (")
+	b.WriteString(paramStr)
+	b.WriteString(") RETURNS ")
+	b.WriteString(f.ReturnType)
+	b.WriteString(" AS $$\nPLPGSQL\n")
+	b.WriteString(body)
+	b.WriteString("\n$$ LANGUAGE plpgsql;")
+	return b.String()
+}
+
+// convertPackageProcedure renders a procedure for a package with appropriate naming (schema or prefix mode)
+func convertPackageProcedure(pkg *Package, p *Procedure, packageAsSchema bool) string {
+	// Build parameter string
+	paramParts := make([]string, 0, len(p.Params))
+	for _, param := range p.Params {
+		part := ""
+		if strings.EqualFold(param.InOut, "OUT") {
+			part = "OUT "
+		}
+		part += param.Name + " " + param.DataType
+		paramParts = append(paramParts, part)
+	}
+
+	paramStr := strings.Join(paramParts, ", ")
+
+	// Extract and minimally convert body
+	body := extractProcBody(p.Body)
+
+	var b strings.Builder
+	b.WriteString("\n\n\n\n")
+	b.WriteString("CREATE OR REPLACE PROCEDURE ")
+
+	// Name depends on package mode
+	if packageAsSchema {
+		// Schema mode: schema.procedure_name
+		b.WriteString(strings.ToLower(pkg.Name))
+		b.WriteString(".")
+		b.WriteString(strings.ToLower(p.Name))
+	} else {
+		// Prefix mode: package_procedure_name
+		procName := strings.ToLower(p.Name)
+		// Remove package prefix if already present
+		pkgPrefix := strings.ToLower(pkg.Name) + "_"
+		if strings.HasPrefix(procName, pkgPrefix) {
+			b.WriteString(procName)
+		} else {
+			b.WriteString(pkgPrefix)
+			b.WriteString(procName)
+		}
+	}
+
+	b.WriteString(" (")
+	if paramStr != "" {
+		b.WriteString(" " + paramStr + " ")
+	}
+	b.WriteString(") AS $$\nPLPGSQL\n")
+	b.WriteString(body)
+	b.WriteString("\n$$ LANGUAGE plpgsql;")
+	return b.String()
 }
 
 // normalizeRecordDefinition formats RECORD field definitions

@@ -100,7 +100,7 @@ func main() {
 		if err != nil {
 			fatalf("load packages: %v", err)
 		}
-		output = renderPackages(pkgs)
+		output = renderPackages(pkgs, config.PackageAsSchema)
 
 	default:
 		fatalf("unsupported export type: %s", *typeName)
@@ -124,9 +124,10 @@ func fatalf(format string, args ...any) {
 
 func loadConfig(path string) (Config, error) {
 	config := Config{
-		OracleUser: "app",
-		OraclePwd:  "app",
-		OracleDSN:  "host=oracle;port=1521;service_name=XEPDB1",
+		OracleUser:      "app",
+		OraclePwd:       "app",
+		OracleDSN:       "host=oracle;port=1521;service_name=XEPDB1",
+		PackageAsSchema: true, // Default: use schema per package
 	}
 
 	file, err := os.Open(path)
@@ -165,9 +166,14 @@ func loadConfig(path string) (Config, error) {
 			config.OracleDSN = value
 		case "schema":
 			config.Schema = value
+		case "package_as_schema":
+			// Default true; set false with "0" or "false"
+			config.PackageAsSchema = strings.ToLower(value) != "0" && strings.ToLower(value) != "false"
 		}
 	}
 
+	// Set default package_as_schema if not explicitly set
+	// (already true by struct initialization, but explicit for clarity)
 	return config, scanner.Err()
 }
 

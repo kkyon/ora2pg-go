@@ -4,10 +4,11 @@ import "database/sql"
 
 // Config represents the export configuration
 type Config struct {
-	OracleDSN   string
-	OracleUser  string
-	OraclePwd   string
-	Schema      string
+	OracleDSN       string
+	OracleUser      string
+	OraclePwd       string
+	Schema          string
+	PackageAsSchema bool // true: create schema per package, false: use package_name prefix
 }
 
 // Column metadata
