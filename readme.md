@@ -11,6 +11,8 @@ while the full migration workspace can remain private.
 This project is a behavior-focused port from a Perl-based Ora2Pg workflow.
 Implementation is metadata-driven and does not copy Perl source code.
 
+> Porting in this repository was completed with GPT-5.3-Codex using VS Code and GitHub Copilot.
+
 ## Current Support
 
 Export types currently supported by the CLI:
