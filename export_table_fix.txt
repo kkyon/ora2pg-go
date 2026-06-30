@@ -1,0 +1,34 @@
+// Fix: Replace constraint ordering logic in renderTable function
+// Remove special-case email handling and output UNIQUEs before PRIMARY KEY
+
+OLD_PATTERN='prePKUniques := make(\[]\*Constraint, 0, len(t.UniqueConstraints))
+	postPKUniques := make(\[]\*Constraint, 0, len(t.UniqueConstraints))
+	for _, c := range t.UniqueConstraints {
+		if len(c.Columns) == 1 \&\& strings.EqualFold(c.Columns\[0\], "email") {
+			postPKUniques = append(postPKUniques, c)
+			continue
+		}
+		prePKUniques = append(prePKUniques, c)
+	}
+	for _, c := range prePKUniques {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}
+	if t.PrimaryKey != nil {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), t.PrimaryKey))
+		b.WriteString("\n")
+	}
+	for _, c := range postPKUniques {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}'
+
+NEW_PATTERN='// Output UNIQUE constraints before PRIMARY KEY to match Ora2Pg parity
+	for _, c := range t.UniqueConstraints {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
+		b.WriteString("\n")
+	}
+	if t.PrimaryKey != nil {
+		b.WriteString(renderConstraint(strings.ToLower(t.Name), t.PrimaryKey))
+		b.WriteString("\n")
+	}'

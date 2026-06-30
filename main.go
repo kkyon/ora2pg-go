@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	typeName := flag.String("type", "TABLE", "Export type: TABLE, TYPE, SEQUENCE, VIEW, MVIEW, PROCEDURE, FUNCTION, PACKAGE")
+	typeName := flag.String("type", "TABLE", "Export type: TABLE, TYPE, SEQUENCE, VIEW, MVIEW, PROCEDURE, FUNCTION, PACKAGE, TRIGGER, SYNONYM, SHOW_REPORT")
 	configPath := flag.String("config", "ora2pg.conf", "Path to ora2pg.conf configuration file")
 	oracleHost := flag.String("oracle-host", "localhost", "Oracle hostname")
 	outPath := flag.String("out", "", "Output file path")
@@ -101,6 +101,27 @@ func main() {
 			fatalf("load packages: %v", err)
 		}
 		output = renderPackages(pkgs, config.PackageAsSchema)
+
+	case "TRIGGER":
+		triggers, err := loadTriggers(db)
+		if err != nil {
+			fatalf("load triggers: %v", err)
+		}
+		output = renderTriggers(triggers)
+
+	case "SYNONYM":
+		synonyms, err := loadSynonyms(db)
+		if err != nil {
+			fatalf("load synonyms: %v", err)
+		}
+		output = renderSynonyms(synonyms)
+
+	case "SHOW_REPORT":
+		report, err := loadShowReport(db)
+		if err != nil {
+			fatalf("load report: %v", err)
+		}
+		output = renderShowReportMarkdown(report)
 
 	default:
 		fatalf("unsupported export type: %s", *typeName)
@@ -219,8 +240,8 @@ func connectOracle(config Config) (*sql.DB, error) {
 
 	// Build Go Oracle driver DSN format
 	// oracle://user:password@host:port/service_name
-	connectionString := fmt.Sprintf("oracle://%s:%s@%s:%d/%s", 
+	connectionString := fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
 		config.OracleUser, config.OraclePwd, host, port, service)
-	
+
 	return sql.Open("oracle", connectionString)
 }

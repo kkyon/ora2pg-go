@@ -13,16 +13,16 @@ type Config struct {
 
 // Column metadata
 type Column struct {
-	Name            string
-	DataType        string
-	Nullable        string
-	VirtualColumn   string
-	DataLength      sql.NullInt64
-	DataPrecision   sql.NullInt64
-	DataScale       sql.NullInt64
-	CharLength      sql.NullInt64
-	DataDefault     sql.NullString
-	ColumnID        int
+	Name          string
+	DataType      string
+	Nullable      string
+	VirtualColumn string
+	DataLength    sql.NullInt64
+	DataPrecision sql.NullInt64
+	DataScale     sql.NullInt64
+	CharLength    sql.NullInt64
+	DataDefault   sql.NullString
+	ColumnID      int
 }
 
 type ColumnComment struct {
@@ -31,11 +31,11 @@ type ColumnComment struct {
 }
 
 type Constraint struct {
-	Name           string
-	Type           string
-	Condition      string
-	Columns        []string
-	IndexName      string
+	Name      string
+	Type      string
+	Condition string
+	Columns   []string
+	IndexName string
 }
 
 type Index struct {
@@ -81,13 +81,13 @@ type TypeDef struct {
 
 // Sequence metadata
 type Sequence struct {
-	Name        string
-	Increment   int64
-	MinValue    int64
-	MaxValue    int64
-	LastNumber  int64
-	CacheSize   int64
-	CycleFlag   string
+	Name       string
+	Increment  int64
+	MinValue   int64
+	MaxValue   int64
+	LastNumber int64
+	CacheSize  int64
+	CycleFlag  string
 }
 
 // View metadata
@@ -157,4 +157,19 @@ type PackageType struct {
 	Name       string
 	TypeKind   string
 	Definition string
+}
+
+// Trigger metadata
+type Trigger struct {
+	Name            string
+	TableName       string
+	TriggeringEvent string
+	TriggerType     string
+	TriggerBody     string
+}
+
+// Synonym metadata
+type Synonym struct {
+	Name       string
+	TargetName string
 }

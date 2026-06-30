@@ -57,7 +57,7 @@ func loadTables(db *sql.DB) ([]*Table, error) {
 		sort.Slice(t.Columns, func(i, j int) bool { return t.Columns[i].ColumnID < t.Columns[j].ColumnID })
 		sort.Slice(t.ColumnComments, func(i, j int) bool { return t.ColumnComments[i].ColumnName < t.ColumnComments[j].ColumnName })
 		sort.Slice(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
-		sort.Slice(t.UniqueConstraints, func(i, j int) bool { return t.UniqueConstraints[i].Name > t.UniqueConstraints[j].Name })
+		// Preserve database order for UNIQUE constraints
 		sort.Slice(t.CheckConstraints, func(i, j int) bool { return t.CheckConstraints[i].Name < t.CheckConstraints[j].Name })
 		adjustPrimaryKeyColumns(t)
 		list = append(list, t)
@@ -545,25 +545,13 @@ func renderTable(t *Table) string {
 		b.WriteString(renderIndex(strings.ToLower(t.Name), idx))
 		b.WriteString("\n")
 	}
-	prePKUniques := make([]*Constraint, 0, len(t.UniqueConstraints))
-	postPKUniques := make([]*Constraint, 0, len(t.UniqueConstraints))
+	// Output UNIQUE constraints before PRIMARY KEY to match Ora2Pg parity
 	for _, c := range t.UniqueConstraints {
-		if len(c.Columns) == 1 && strings.EqualFold(c.Columns[0], "email") {
-			postPKUniques = append(postPKUniques, c)
-			continue
-		}
-		prePKUniques = append(prePKUniques, c)
-	}
-	for _, c := range prePKUniques {
 		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
 		b.WriteString("\n")
 	}
 	if t.PrimaryKey != nil {
 		b.WriteString(renderConstraint(strings.ToLower(t.Name), t.PrimaryKey))
-		b.WriteString("\n")
-	}
-	for _, c := range postPKUniques {
-		b.WriteString(renderConstraint(strings.ToLower(t.Name), c))
 		b.WriteString("\n")
 	}
 	for _, c := range t.CheckConstraints {
@@ -738,7 +726,24 @@ func isNotNullCheck(condition string) bool {
 // Helper functions
 
 func normalizeExpression(expr string) string {
-	return strings.TrimSpace(expr)
+	v := normalizeWhitespace(strings.TrimSpace(expr))
+
+	// Oracle exposes function-based index expressions with quoted uppercase
+	// identifiers (for example UPPER("EMAIL")). Ora2Pg output uses lowercase,
+	// unquoted identifiers (upper(email)).
+	v = regexp.MustCompile(`"([A-Za-z0-9_$#]+)"`).ReplaceAllStringFunc(v, func(s string) string {
+		name := strings.Trim(s, `"`)
+		return strings.ToLower(name)
+	})
+	v = regexp.MustCompile(`\b([A-Z][A-Z0-9_$#]*)\s*\(`).ReplaceAllStringFunc(v, func(s string) string {
+		m := regexp.MustCompile(`^([A-Z][A-Z0-9_$#]*)`).FindString(s)
+		if m == "" {
+			return s
+		}
+		return strings.ToLower(m) + s[len(m):]
+	})
+
+	return v
 }
 
 func normalizeCheck(condition string) string {
